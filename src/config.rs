@@ -83,8 +83,8 @@ pub fn default_exclude() -> Vec<String> {
 impl Config {
     /// 配置文件路径: `~/.config/yun139/config.toml`
     pub fn config_path() -> Result<PathBuf, ConfigError> {
-        let config_dir = dirs::config_dir().ok_or(ConfigError::NoConfigDir)?;
-        Ok(config_dir.join("yun139").join("config.toml"))
+        let home = dirs::home_dir().ok_or(ConfigError::NoConfigDir)?;
+        Ok(home.join(".config").join("yun139").join("config.toml"))
     }
 
     /// 从配置文件加载。
