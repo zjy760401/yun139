@@ -52,6 +52,7 @@ impl Yun139Client {
                     size: item.size.unwrap_or(0),
                     is_folder: item.file_type.as_deref() == Some("folder"),
                     updated_at: item.updated_at.clone().unwrap_or_default(),
+                    content_hash: item.content_hash.clone().unwrap_or_default(),
                 });
 
                 if limit > 0 && all_items.len() >= limit {

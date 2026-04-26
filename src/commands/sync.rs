@@ -381,17 +381,19 @@ async fn scan_dir_inner(
                 new_dirs.push(DirInfo { name: le.name.clone(), cloud_path, is_new });
             }
 
+            // 需要 hash 比较的文件（same size，云盘有 content_hash）
+            struct HashCheck { local: PathBuf, cloud_dir: String, cloud_hash: String }
+            let mut to_hash_check: Vec<HashCheck> = Vec::new();
+
             for le in local_entries.iter().filter(|e| !e.is_dir) {
                 match cloud_map.get(le.name.as_str()) {
                     None => {
-                        // 云盘没有 → 上传
                         to_upload.push(FileInfo {
                             local: local_dir.join(&le.name),
                             cloud_dir: cloud_dir.clone(),
                         });
                     }
                     Some(ci) if ci.size != le.size as i64 => {
-                        // size 不同 → 比较 mtime，本地更新才上传
                         let cloud_mtime = parse_cloud_mtime_ms(&ci.updated_at);
                         if le.mtime_ms >= cloud_mtime {
                             to_upload.push(FileInfo {
@@ -403,9 +405,31 @@ async fn scan_dir_inner(
                             skip_count += 1;
                         }
                     }
-                    _ => {
-                        skip_count += 1;
+                    Some(ci) => {
+                        // same size → 用 hash 判别
+                        if !ci.content_hash.is_empty() {
+                            to_hash_check.push(HashCheck {
+                                local: local_dir.join(&le.name),
+                                cloud_dir: cloud_dir.clone(),
+                                cloud_hash: ci.content_hash.clone(),
+                            });
+                        } else {
+                            skip_count += 1;
+                        }
                     }
+                }
+            }
+
+            // 并行计算本地 SHA256，与云盘 hash 对比
+            for hc in to_hash_check {
+                let path = hc.local.clone();
+                let local_hash = tokio::task::spawn_blocking(move || compute_sha256_hex(&path))
+                    .await.unwrap_or_default();
+                if local_hash != hc.cloud_hash {
+                    tracing::debug!(file = %hc.local.display(), "hash mismatch → upload");
+                    to_upload.push(FileInfo { local: hc.local, cloud_dir: hc.cloud_dir });
+                } else {
+                    skip_count += 1;
                 }
             }
 
@@ -475,10 +499,12 @@ async fn scan_dir_inner(
                 new_dirs.push(DirInfo { name: ci.name.clone(), is_new });
             }
 
+            struct HashCheck { cloud: String, local: PathBuf, size: u64, cloud_hash: String }
+            let mut to_hash_check: Vec<HashCheck> = Vec::new();
+
             for ci in cloud_items.iter().filter(|e| !e.is_folder) {
                 match local_map.get(ci.name.as_str()) {
                     None => {
-                        // 本地没有 → 下载
                         to_download.push(FileInfo {
                             cloud: rel_cloud(ct, &prefix, &ci.name),
                             local: local_dir.join(&ci.name),
@@ -486,7 +512,6 @@ async fn scan_dir_inner(
                         });
                     }
                     Some(le) if le.size as i64 != ci.size => {
-                        // size 不同 → 比较 mtime，云盘更新才下载
                         let cloud_mtime = parse_cloud_mtime_ms(&ci.updated_at);
                         if cloud_mtime >= le.mtime_ms {
                             to_download.push(FileInfo {
@@ -499,9 +524,30 @@ async fn scan_dir_inner(
                             skip_count += 1;
                         }
                     }
-                    _ => {
-                        skip_count += 1;
+                    Some(_le) => {
+                        if !ci.content_hash.is_empty() {
+                            to_hash_check.push(HashCheck {
+                                cloud: rel_cloud(ct, &prefix, &ci.name),
+                                local: local_dir.join(&ci.name),
+                                size: ci.size as u64,
+                                cloud_hash: ci.content_hash.clone(),
+                            });
+                        } else {
+                            skip_count += 1;
+                        }
                     }
+                }
+            }
+
+            for hc in to_hash_check {
+                let path = hc.local.clone();
+                let local_hash = tokio::task::spawn_blocking(move || compute_sha256_hex(&path))
+                    .await.unwrap_or_default();
+                if local_hash != hc.cloud_hash {
+                    tracing::debug!(file = %hc.local.display(), "hash mismatch → download");
+                    to_download.push(FileInfo { cloud: hc.cloud, local: hc.local, size: hc.size });
+                } else {
+                    skip_count += 1;
                 }
             }
 
@@ -767,4 +813,24 @@ fn parse_cloud_mtime_ms(updated_at: &str) -> i64 {
         .or_else(|_| chrono::DateTime::parse_from_str(updated_at, "%Y-%m-%dT%H:%M:%S%.f%:z"))
         .map(|dt| dt.timestamp_millis())
         .unwrap_or(0)
+}
+
+/// 计算文件 SHA256（blocking，用于 spawn_blocking）。
+fn compute_sha256_hex(path: &Path) -> String {
+    use digest::Digest;
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return String::new(),
+    };
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = vec![0u8; 2 * 1024 * 1024];
+    loop {
+        let n = match std::io::Read::read(&mut file, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => return String::new(),
+        };
+        hasher.update(&buf[..n]);
+    }
+    hex::encode(hasher.finalize())
 }

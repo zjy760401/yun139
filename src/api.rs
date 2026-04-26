@@ -96,6 +96,8 @@ pub struct FileItem {
     pub file_type: Option<String>,
     #[serde(rename = "updatedAt", default)]
     pub updated_at: Option<String>,
+    #[serde(rename = "contentHash", default)]
+    pub content_hash: Option<String>,
 }
 
 // ── 下载链接 ──
