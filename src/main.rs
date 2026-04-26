@@ -1,11 +1,26 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+
+/// 格式: 0.01.XXXX (主版本.子版本.提交次数)
+fn version_string() -> &'static str {
+    // commit count 由 build.rs 在编译时注入
+    const COMMIT_COUNT: &str = env!("GIT_COMMIT_COUNT");
+
+    // 用 const + macro 无法拼接，运行时 leak 一次即可
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| {
+        format!("0.01.{:0>4}", COMMIT_COUNT)
+    })
+}
 
 /// 中国移动云盘 (139网盘) CLI
 #[derive(Parser)]
-#[command(name = "yun139-cli", version, about = "139 云盘命令行工具")]
+#[command(
+    name = "yun139-cli",
+    about = "139 云盘命令行工具",
+)]
 struct Cli {
     /// Authorization 令牌（临时覆盖，优先于配置文件和环境变量）
     #[arg(short, long, env = "YUN139_AUTH", global = true, hide_env_values = true)]
@@ -136,7 +151,10 @@ enum ConfigSetItem {
 
 #[tokio::main]
 async fn main() {
-    let cli = Cli::parse();
+    let matches = Cli::command()
+        .version(version_string())
+        .get_matches();
+    let cli = Cli::from_arg_matches(&matches).expect("parse CLI args");
 
     // 日志初始化
     let _log_guard = init_logging();
