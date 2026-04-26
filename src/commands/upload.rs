@@ -14,7 +14,7 @@ use crate::api::*;
 use crate::error::{Result, Yun139Error};
 use crate::Yun139Client;
 
-const MAX_RETRIES: u32 = 3;
+const MAX_RETRIES: u32 = 5;
 /// ≤ 此值走单次上传，> 此值走分片
 const SMALL_FILE_THRESHOLD: u64 = 10 * 1024 * 1024;
 
@@ -144,7 +144,7 @@ impl Yun139Client {
             use std::sync::atomic::{AtomicU64, Ordering};
             use std::sync::Arc;
 
-            const UPLOAD_PARALLEL: usize = 4;
+            const UPLOAD_PARALLEL: usize = 2;
             tracing::info!(parts = part_count, parallel = UPLOAD_PARALLEL, "uploading parts in parallel");
 
             let uploaded_total = Arc::new(AtomicU64::new(0));
@@ -253,7 +253,7 @@ async fn fetch_all_upload_urls(
     Ok(urls)
 }
 
-/// 小文件：整块 bytes PUT（带重试）。
+/// 小文件：整块 bytes PUT（带重试 + 指数退避）。
 async fn put_bytes_with_retry(oss: &reqwest::Client, url: &str, buf: &[u8], part: i32) -> Result<()> {
     let mut last_err = None;
     for attempt in 1..=MAX_RETRIES {
@@ -262,19 +262,20 @@ async fn put_bytes_with_retry(oss: &reqwest::Client, url: &str, buf: &[u8], part
             Ok(r) => { let s = r.status(); let b = r.text().await.unwrap_or_default(); tracing::warn!(part, attempt, status = %s, "PUT failed"); last_err = Some(Yun139Error::Api { code: s.as_u16().to_string(), message: b }); }
             Err(e) => { tracing::warn!(part, attempt, err = %e, "PUT error"); last_err = Some(Yun139Error::Http(e)); }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+        let delay = std::time::Duration::from_secs(1 << attempt.min(4));
+        tokio::time::sleep(delay).await;
     }
     Err(last_err.unwrap())
 }
 
-/// 大文件分片：64KB 流式 PUT（带重试）。
+/// 大文件分片：流式 PUT（带重试 + 指数退避）。
 async fn stream_put_with_retry(oss: &reqwest::Client, url: &str, path: &std::path::Path, offset: u64, size: usize, part: i32) -> Result<()> {
     let mut last_err = None;
     for attempt in 1..=MAX_RETRIES {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
-        const CHUNK: usize = 64 * 1024;
+        const CHUNK: usize = 256 * 1024; // 256KB chunks
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<std::result::Result<Vec<u8>, std::io::Error>>(2);
+        let (tx, rx) = tokio::sync::mpsc::channel::<std::result::Result<Vec<u8>, std::io::Error>>(4);
         let p = path.to_path_buf();
         let producer = tokio::spawn(async move {
             let mut f = tokio::fs::File::open(&p).await?;
@@ -300,7 +301,8 @@ async fn stream_put_with_retry(oss: &reqwest::Client, url: &str, path: &std::pat
             Ok(r) => { let s = r.status(); let b = r.text().await.unwrap_or_default(); tracing::warn!(part, attempt, status = %s, "PUT failed"); last_err = Some(Yun139Error::Api { code: s.as_u16().to_string(), message: b }); }
             Err(e) => { tracing::warn!(part, attempt, err = %e, "PUT error"); last_err = Some(Yun139Error::Http(e)); }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+        let delay = std::time::Duration::from_secs(1 << attempt.min(4));
+        tokio::time::sleep(delay).await;
     }
     Err(last_err.unwrap())
 }
