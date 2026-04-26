@@ -382,17 +382,30 @@ async fn scan_dir_inner(
             }
 
             for le in local_entries.iter().filter(|e| !e.is_dir) {
-                let need = match cloud_map.get(le.name.as_str()) {
-                    None => true,
-                    Some(ci) => ci.size != le.size as i64,
-                };
-                if need {
-                    to_upload.push(FileInfo {
-                        local: local_dir.join(&le.name),
-                        cloud_dir: cloud_dir.clone(),
-                    });
-                } else {
-                    skip_count += 1;
+                match cloud_map.get(le.name.as_str()) {
+                    None => {
+                        // 云盘没有 → 上传
+                        to_upload.push(FileInfo {
+                            local: local_dir.join(&le.name),
+                            cloud_dir: cloud_dir.clone(),
+                        });
+                    }
+                    Some(ci) if ci.size != le.size as i64 => {
+                        // size 不同 → 比较 mtime，本地更新才上传
+                        let cloud_mtime = parse_cloud_mtime_ms(&ci.updated_at);
+                        if le.mtime_ms >= cloud_mtime {
+                            to_upload.push(FileInfo {
+                                local: local_dir.join(&le.name),
+                                cloud_dir: cloud_dir.clone(),
+                            });
+                        } else {
+                            tracing::debug!(file = %le.name, "skip: cloud is newer");
+                            skip_count += 1;
+                        }
+                    }
+                    _ => {
+                        skip_count += 1;
+                    }
                 }
             }
 
@@ -463,18 +476,32 @@ async fn scan_dir_inner(
             }
 
             for ci in cloud_items.iter().filter(|e| !e.is_folder) {
-                let need = match local_map.get(ci.name.as_str()) {
-                    None => true,
-                    Some(le) => le.size as i64 != ci.size,
-                };
-                if need {
-                    to_download.push(FileInfo {
-                        cloud: rel_cloud(ct, &prefix, &ci.name),
-                        local: local_dir.join(&ci.name),
-                        size: ci.size as u64,
-                    });
-                } else {
-                    skip_count += 1;
+                match local_map.get(ci.name.as_str()) {
+                    None => {
+                        // 本地没有 → 下载
+                        to_download.push(FileInfo {
+                            cloud: rel_cloud(ct, &prefix, &ci.name),
+                            local: local_dir.join(&ci.name),
+                            size: ci.size as u64,
+                        });
+                    }
+                    Some(le) if le.size as i64 != ci.size => {
+                        // size 不同 → 比较 mtime，云盘更新才下载
+                        let cloud_mtime = parse_cloud_mtime_ms(&ci.updated_at);
+                        if cloud_mtime >= le.mtime_ms {
+                            to_download.push(FileInfo {
+                                cloud: rel_cloud(ct, &prefix, &ci.name),
+                                local: local_dir.join(&ci.name),
+                                size: ci.size as u64,
+                            });
+                        } else {
+                            tracing::debug!(file = %ci.name, "skip: local is newer");
+                            skip_count += 1;
+                        }
+                    }
+                    _ => {
+                        skip_count += 1;
+                    }
                 }
             }
 
@@ -668,6 +695,8 @@ struct LocalEntry {
     name: String,
     is_dir: bool,
     size: u64,
+    /// 修改时间（毫秒时间戳，0 表示无法获取）
+    mtime_ms: i64,
 }
 
 fn read_local_dir(dir: &Path, exclude: &[String]) -> Vec<LocalEntry> {
@@ -682,11 +711,12 @@ fn read_local_dir(dir: &Path, exclude: &[String]) -> Vec<LocalEntry> {
             Err(_) => continue,
         };
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') && !exclude.is_empty() {
-            // 隐藏文件如果在排除列表中也跳过（默认已排除 .DS_Store 等）
-        }
         if is_excluded(&name, exclude) { continue; }
-        entries.push(LocalEntry { name, is_dir: meta.is_dir(), size: meta.len() });
+        let mtime_ms = meta.modified().ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        entries.push(LocalEntry { name, is_dir: meta.is_dir(), size: meta.len(), mtime_ms });
     }
     entries
 }
@@ -729,4 +759,12 @@ fn rel_path(prefix: &str, name: &str) -> String {
 
 fn rel_cloud(ct: &str, prefix: &str, name: &str) -> String {
     if prefix.is_empty() { format!("{ct}/{name}") } else { format!("{ct}/{prefix}/{name}") }
+}
+
+/// 解析云盘 updated_at 字符串为毫秒时间戳。
+fn parse_cloud_mtime_ms(updated_at: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(updated_at)
+        .or_else(|_| chrono::DateTime::parse_from_str(updated_at, "%Y-%m-%dT%H:%M:%S%.f%:z"))
+        .map(|dt| dt.timestamp_millis())
+        .unwrap_or(0)
 }
