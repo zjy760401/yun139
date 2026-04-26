@@ -1,36 +1,26 @@
 //! 同步命令 — 本地目录与云盘目录流式并行同步。
 //!
-//! **流式模型（JoinSet + 固定最大并发数）**:
-//!
-//! 单个生产者协程 BFS 遍历目录树，逐目录对比本地 vs 云盘。
-//! 发现差异时立即 spawn 任务到 JoinSet。JoinSet 满时 await 等待
-//! 一个完成后再继续遍历。遍历和传输完全交叉，无需等扫描完毕。
+//! **并行模型**:
 //!
 //! ```text
-//! streaming_sync()
-//! ┌─────────────────────────────────────────────┐
-//! │  Producer: BFS(VecDeque)                     │
-//! │    for each dir:                             │
-//! │      read local + list cloud                 │
-//! │      new dir    → ensure_dir / mkdir 串行     │
-//! │      need xfer  → join_set.spawn(upload/dl)  │
-//! │      need delete→ pending_deletes.push()     │
-//! │      same size  → skip++                     │
-//! │                                              │
-//! │      while join_set.len() >= max_parallel:   │
-//! │        join_set.join_next().await  ← 背压     │
-//! │                                              │
-//! │  drain: while join_set.join_next() {}        │
-//! │  execute pending_deletes serially            │
-//! └─────────────────────────────────────────────┘
+//!   scan (递归 spawn，无并行度限制)
+//!     ├─ 子目录 → tokio::spawn(scan_dir)     ← 无限扩散
+//!     ├─ 文件上传/下载 → JoinSet.spawn()      ← JoinSet 背压 = P
+//!     │    └─ upload/download 内部分片         ← Semaphore = P
+//!     └─ 删除 → pending_deletes
+//!
+//!   JoinSet 并行度 = config.parallel (P)
+//!   Semaphore 并行度 = config.parallel (P)
+//!   总并行度 ≈ P × 2
 //! ```
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use tokio::sync::Mutex as TokioMutex;
 
 use crate::commands::list::ListItem;
 use crate::config::DEFAULT_PARALLEL;
@@ -119,16 +109,40 @@ impl Yun139Client {
     }
 }
 
-// ── 流式并行同步核心 ──
+// ── 共享上下文 ──
 
-/// BFS 目录队列条目
-struct DirJob {
-    local_dir: PathBuf,
-    cloud_dir: String,
-    prefix: String,
-    /// 本地独有的新目录 — 跳过云盘 list API（云盘侧肯定为空）
-    local_only: bool,
+/// 在所有 scan/transfer 协程间共享的状态。
+struct SyncCtx {
+    client: Yun139Client,
+    direction: SyncDirection,
+    delete: bool,
+    cloud_root: String,
+    parallel: usize,
+
+    // JoinSet（TokioMutex 保护，因为多个 scan 协程会并发 push）
+    join_set: TokioMutex<tokio::task::JoinSet<()>>,
+    // 分片传输信号量（upload/download 内部的分片并发）
+    transfer_sem: Arc<tokio::sync::Semaphore>,
+
+    // 延迟删除（scan 完毕后串行执行）
+    pending_deletes: TokioMutex<Vec<SyncAction>>,
+
+    // 计数器
+    uploaded: Arc<AtomicU32>,
+    downloaded: Arc<AtomicU32>,
+    dirs_created: Arc<AtomicU32>,
+    skipped: Arc<AtomicU32>,
+    failed: Arc<AtomicU32>,
+    failed_files: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+
+    // 进度条
+    mp: MultiProgress,
+    scan_pb: ProgressBar,
+    overall_pb: ProgressBar,
+    task_style: ProgressStyle,
 }
+
+// ── 入口 ──
 
 async fn streaming_sync(
     client: &Yun139Client,
@@ -137,21 +151,10 @@ async fn streaming_sync(
     direction: SyncDirection,
     opts: &SyncOptions,
 ) -> Result<SyncSummary> {
-    let max_parallel = opts.concurrency;
+    let p = opts.concurrency;
+    let ct = cloud_root.trim_end_matches('/').to_string();
 
-    // 共享计数器
-    let uploaded = Arc::new(AtomicU32::new(0));
-    let downloaded = Arc::new(AtomicU32::new(0));
-    let dirs_created = Arc::new(AtomicU32::new(0));
-    let skipped = Arc::new(AtomicU32::new(0));
-    let failed = Arc::new(AtomicU32::new(0));
-    let failed_files: Arc<std::sync::Mutex<Vec<(String, String)>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
-
-    // 延迟删除列表（遍历完后串行执行）
-    let mut pending_deletes: Vec<SyncAction> = Vec::new();
-
-    // ── indicatif ──
+    // 进度条
     let mp = MultiProgress::new();
 
     let scan_pb = mp.add(ProgressBar::new_spinner());
@@ -176,215 +179,72 @@ async fn streaming_sync(
     .unwrap()
     .progress_chars("━╸─");
 
-    // ── JoinSet ──
-    let mut join_set = tokio::task::JoinSet::new();
-
-    // BFS 队列
-    let ct = cloud_root.trim_end_matches('/').to_string();
-    let mut queue = VecDeque::new();
-    queue.push_back(DirJob {
-        local_dir: local_root.to_path_buf(),
-        cloud_dir: ct.clone(),
-        prefix: String::new(),
-        local_only: false,
+    let ctx = Arc::new(SyncCtx {
+        client: client.clone(),
+        direction,
+        delete: opts.delete,
+        cloud_root: ct.clone(),
+        parallel: p,
+        join_set: TokioMutex::new(tokio::task::JoinSet::new()),
+        transfer_sem: Arc::new(tokio::sync::Semaphore::new(p)),
+        pending_deletes: TokioMutex::new(Vec::new()),
+        uploaded: Arc::new(AtomicU32::new(0)),
+        downloaded: Arc::new(AtomicU32::new(0)),
+        dirs_created: Arc::new(AtomicU32::new(0)),
+        skipped: Arc::new(AtomicU32::new(0)),
+        failed: Arc::new(AtomicU32::new(0)),
+        failed_files: Arc::new(std::sync::Mutex::new(Vec::new())),
+        mp: mp.clone(),
+        scan_pb: scan_pb.clone(),
+        overall_pb: overall_pb.clone(),
+        task_style,
     });
 
-    // ── 生产者: BFS 遍历 + spawn 任务 ──
-    while let Some(job) = queue.pop_front() {
-        scan_pb.set_message(if job.prefix.is_empty() {
-            "/".to_string()
-        } else {
-            truncate_name(&job.prefix, 50)
-        });
-
-        // 并行获取本地和云盘列表
-        let local_dir_owned = job.local_dir.clone();
-        let local_entries_handle = tokio::task::spawn_blocking(move || {
-            read_local_dir(&local_dir_owned)
-        });
-
-        // 本地独有目录跳过云盘 API（云盘侧刚创建，肯定为空）
-        let cloud_items = if job.local_only {
-            Vec::new()
-        } else {
-            client.list_all_quiet(&job.cloud_dir).await.unwrap_or_default()
-        };
-
-        let local_entries = match local_entries_handle.await {
-            Ok(v) => v,
-            Err(_) => Vec::new(),
-        };
-
-        let local_map: HashMap<&str, &LocalEntry> =
-            local_entries.iter().map(|e| (e.name.as_str(), e)).collect();
-        let cloud_map: HashMap<&str, &ListItem> =
-            cloud_items.iter().map(|e| (e.name.as_str(), e)).collect();
-
-        match direction {
-            SyncDirection::LocalToCloud => {
-                // 本地有的
-                for le in &local_entries {
-                    if le.is_dir {
-                        let cloud_path = rel_cloud(&ct, &job.prefix, &le.name);
-                        let is_new = !cloud_map.contains_key(le.name.as_str());
-                        if is_new {
-                            // 新目录 → 串行创建
-                            scan_pb.set_message(format!("📁 {cloud_path}"));
-                            match client.ensure_dir(&cloud_path).await {
-                                Ok(_) => { dirs_created.fetch_add(1, Ordering::Relaxed); }
-                                Err(e) => {
-                                    tracing::error!(err = %e, dir = %cloud_path, "mkdir cloud failed");
-                                    failed.fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
-                        }
-                        // 子目录加入队列（本地独有时标记 local_only 以跳过云盘 list）
-                        queue.push_back(DirJob {
-                            local_dir: job.local_dir.join(&le.name),
-                            cloud_dir: cloud_path,
-                            prefix: rel_path(&job.prefix, &le.name),
-                            local_only: is_new,
-                        });
-                    } else {
-                        // 文件：对比 size
-                        let need_upload = match cloud_map.get(le.name.as_str()) {
-                            None => true,
-                            Some(ci) => ci.size != le.size as i64,
-                        };
-                        if need_upload {
-                            overall_pb.inc_length(1);
-                            let local = job.local_dir.join(&le.name);
-                            let cloud_dir = job.cloud_dir.clone();
-                            spawn_upload(
-                                &mut join_set, client, local, cloud_dir,
-                                &uploaded, &downloaded, &failed, &failed_files,
-                                &mp, &overall_pb, &task_style,
-                            );
-                        } else {
-                            skipped.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                }
-                // 云盘有、本地无 → 收集删除（目录需递归收集子文件）
-                if opts.delete {
-                    for ci in &cloud_items {
-                        if !local_map.contains_key(ci.name.as_str()) {
-                            let cloud = rel_cloud(&ct, &job.prefix, &ci.name);
-                            if ci.is_folder {
-                                // 递归收集云盘子目录中的所有内容
-                                collect_cloud_deletes_recursive(
-                                    client, &cloud, &mut pending_deletes,
-                                ).await;
-                            }
-                            pending_deletes.push(SyncAction::DeleteCloud { cloud });
-                        }
-                    }
-                }
-            }
-            SyncDirection::CloudToLocal => {
-                // 云盘有的
-                for ci in &cloud_items {
-                    if ci.is_folder {
-                        let is_new = !local_map.contains_key(ci.name.as_str());
-                        if is_new {
-                            let local_path = job.local_dir.join(&ci.name);
-                            scan_pb.set_message(format!("📁 {}", local_path.display()));
-                            match tokio::fs::create_dir_all(&local_path).await {
-                                Ok(_) => { dirs_created.fetch_add(1, Ordering::Relaxed); }
-                                Err(e) => {
-                                    tracing::error!(err = %e, dir = %local_path.display(), "mkdir local failed");
-                                    failed.fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
-                        }
-                        queue.push_back(DirJob {
-                            local_dir: job.local_dir.join(&ci.name),
-                            cloud_dir: rel_cloud(&ct, &job.prefix, &ci.name),
-                            prefix: rel_path(&job.prefix, &ci.name),
-                            local_only: false,
-                        });
-                    } else {
-                        let need_download = match local_map.get(ci.name.as_str()) {
-                            None => true,
-                            Some(le) => le.size as i64 != ci.size,
-                        };
-                        if need_download {
-                            overall_pb.inc_length(1);
-                            let cloud = rel_cloud(&ct, &job.prefix, &ci.name);
-                            let local = job.local_dir.join(&ci.name);
-                            spawn_download(
-                                &mut join_set, client, cloud, local, ci.size as u64,
-                                max_parallel,
-                                &uploaded, &downloaded, &failed, &failed_files,
-                                &mp, &overall_pb, &task_style,
-                            );
-                        } else {
-                            skipped.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                }
-                // 本地有、云盘无 → 收集删除（目录用 remove_dir_all 即可）
-                if opts.delete {
-                    for le in &local_entries {
-                        if !cloud_map.contains_key(le.name.as_str()) {
-                            pending_deletes.push(SyncAction::DeleteLocal {
-                                local: job.local_dir.join(&le.name),
-                            });
-                            // 本地目录无需递归收集，remove_dir_all 会处理
-                        }
-                    }
-                }
-            }
-        }
-
-        // ── 背压: JoinSet 满了就等一个完成 ──
-        while join_set.len() >= max_parallel {
-            join_set.join_next().await;
-        }
-    }
+    // ── 递归扫描（自动扩散，无并行度限制） ──
+    scan_dir(
+        ctx.clone(),
+        local_root.to_path_buf(),
+        ct.clone(),
+        String::new(),
+        false,
+    ).await;
 
     // ── 扫描完毕 ──
     scan_pb.set_style(ProgressStyle::with_template("  {prefix} {msg}").unwrap());
     scan_pb.set_prefix("✓");
+    let pending_len = ctx.pending_deletes.lock().await.len();
     scan_pb.finish_with_message(format!(
         "扫描完成 ({} 跳过, {} 目录, {} 待删除)",
-        skipped.load(Ordering::Relaxed),
-        dirs_created.load(Ordering::Relaxed),
-        pending_deletes.len(),
+        ctx.skipped.load(Ordering::Relaxed),
+        ctx.dirs_created.load(Ordering::Relaxed),
+        pending_len,
     ));
 
-    // ── drain 剩余传输任务 ──
-    while join_set.join_next().await.is_some() {}
+    // ── drain JoinSet 中剩余传输任务 ──
+    {
+        let mut js = ctx.join_set.lock().await;
+        while js.join_next().await.is_some() {}
+    }
     overall_pb.finish_and_clear();
 
     // ── 串行执行删除 ──
-    if !pending_deletes.is_empty() {
-        // 排序：文件先于目录，深层先于浅层
-        pending_deletes.sort_by(|a, b| {
-            let (a_dir, a_path) = match a {
-                SyncAction::DeleteCloud { cloud } => (false, cloud.as_str()),
-                SyncAction::DeleteLocal { local } => (local.is_dir(), local.to_str().unwrap_or("")),
-                _ => (false, ""),
-            };
-            let (b_dir, b_path) = match b {
-                SyncAction::DeleteCloud { cloud } => (false, cloud.as_str()),
-                SyncAction::DeleteLocal { local } => (local.is_dir(), local.to_str().unwrap_or("")),
-                _ => (false, ""),
-            };
-            a_dir.cmp(&b_dir).then_with(|| {
-                b_path.matches('/').count().cmp(&a_path.matches('/').count())
-            })
+    let mut pending = ctx.pending_deletes.lock().await.clone();
+    let deleted = Arc::new(AtomicU32::new(0));
+
+    if !pending.is_empty() {
+        pending.sort_by(|a, b| {
+            let (ad, ap) = delete_sort_key(a);
+            let (bd, bp) = delete_sort_key(b);
+            ad.cmp(&bd).then_with(|| bp.matches('/').count().cmp(&ap.matches('/').count()))
         });
 
-        let del_pb = mp.add(ProgressBar::new(pending_deletes.len() as u64));
+        let del_pb = mp.add(ProgressBar::new(pending.len() as u64));
         del_pb.set_style(
             ProgressStyle::with_template("  🗑️  [{bar:20.red/dim}] {pos}/{len} {msg}")
-                .unwrap()
-                .progress_chars("━╸─"),
+                .unwrap().progress_chars("━╸─"),
         );
-        let deleted = Arc::new(AtomicU32::new(0));
 
-        for action in &pending_deletes {
+        for action in &pending {
             match action {
                 SyncAction::DeleteCloud { cloud } => {
                     del_pb.set_message(truncate_name(cloud, 40));
@@ -392,7 +252,7 @@ async fn streaming_sync(
                         Ok(_) => { deleted.fetch_add(1, Ordering::Relaxed); }
                         Err(e) => {
                             tracing::error!(err = %e, file = %cloud, "delete cloud failed");
-                            failed.fetch_add(1, Ordering::Relaxed);
+                            ctx.failed.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
@@ -403,11 +263,12 @@ async fn streaming_sync(
                     } else {
                         tokio::fs::remove_file(local).await
                     };
-                    if let Err(e) = res {
-                        tracing::error!(err = %e, "delete local failed");
-                        failed.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        deleted.fetch_add(1, Ordering::Relaxed);
+                    match res {
+                        Ok(_) => { deleted.fetch_add(1, Ordering::Relaxed); }
+                        Err(e) => {
+                            tracing::error!(err = %e, "delete local failed");
+                            ctx.failed.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
                 _ => {}
@@ -415,28 +276,10 @@ async fn streaming_sync(
             del_pb.inc(1);
         }
         del_pb.finish_and_clear();
-
-        // 打印失败列表
-        let failures = failed_files.lock().unwrap();
-        if !failures.is_empty() {
-            eprintln!("\n以下文件传输失败:");
-            for (path, reason) in failures.iter() {
-                eprintln!("  {path} — {reason}");
-            }
-        }
-
-        return Ok(SyncSummary {
-            uploaded: uploaded.load(Ordering::Relaxed),
-            downloaded: downloaded.load(Ordering::Relaxed),
-            dirs_created: dirs_created.load(Ordering::Relaxed),
-            deleted: deleted.load(Ordering::Relaxed),
-            skipped: skipped.load(Ordering::Relaxed),
-            failed: failed.load(Ordering::Relaxed),
-        });
     }
 
     // 打印失败列表
-    let failures = failed_files.lock().unwrap();
+    let failures = ctx.failed_files.lock().unwrap();
     if !failures.is_empty() {
         eprintln!("\n以下文件传输失败:");
         for (path, reason) in failures.iter() {
@@ -445,171 +288,345 @@ async fn streaming_sync(
     }
 
     Ok(SyncSummary {
-        uploaded: uploaded.load(Ordering::Relaxed),
-        downloaded: downloaded.load(Ordering::Relaxed),
-        dirs_created: dirs_created.load(Ordering::Relaxed),
-        deleted: 0,
-        skipped: skipped.load(Ordering::Relaxed),
-        failed: failed.load(Ordering::Relaxed),
+        uploaded: ctx.uploaded.load(Ordering::Relaxed),
+        downloaded: ctx.downloaded.load(Ordering::Relaxed),
+        dirs_created: ctx.dirs_created.load(Ordering::Relaxed),
+        deleted: deleted.load(Ordering::Relaxed),
+        skipped: ctx.skipped.load(Ordering::Relaxed),
+        failed: ctx.failed.load(Ordering::Relaxed),
     })
 }
 
-// ── spawn 辅助 ──
+fn delete_sort_key(a: &SyncAction) -> (bool, &str) {
+    match a {
+        SyncAction::DeleteCloud { cloud } => (false, cloud.as_str()),
+        SyncAction::DeleteLocal { local } => (local.is_dir(), local.to_str().unwrap_or("")),
+        _ => (false, ""),
+    }
+}
 
-#[allow(clippy::too_many_arguments)]
-fn spawn_upload(
-    join_set: &mut tokio::task::JoinSet<()>,
-    client: &Yun139Client,
-    local: PathBuf,
+// ── 递归扫描（无并行度限制，自由扩散） ──
+
+/// 扫描单个目录：对比本地 vs 云盘，子目录递归 spawn，文件差异推入 JoinSet。
+fn scan_dir(
+    ctx: Arc<SyncCtx>,
+    local_dir: PathBuf,
     cloud_dir: String,
-    uploaded: &Arc<AtomicU32>,
-    downloaded: &Arc<AtomicU32>,
-    failed: &Arc<AtomicU32>,
-    failed_files: &Arc<std::sync::Mutex<Vec<(String, String)>>>,
-    mp: &MultiProgress,
-    overall_pb: &ProgressBar,
-    task_style: &ProgressStyle,
-) {
-    let client = client.clone();
-    let uploaded = uploaded.clone();
-    let downloaded = downloaded.clone();
-    let failed = failed.clone();
-    let failed_files = failed_files.clone();
-    let mp = mp.clone();
-    let overall_pb = overall_pb.clone();
-    let task_style = task_style.clone();
-
-    join_set.spawn(async move {
-        let file_size = tokio::fs::metadata(&local).await.map(|m| m.len()).unwrap_or(0);
-        let pb = mp.insert_before(&overall_pb, ProgressBar::new(file_size));
-        pb.set_style(task_style);
-        let name = local.file_name().unwrap_or_default().to_string_lossy().to_string();
-        pb.set_prefix(format!("↑ {}", truncate_name(&name, 28)));
-
-        let pb2 = pb.clone();
-        match client.upload_file(&local, &cloud_dir, move |bytes, _| { pb2.set_position(bytes); }).await {
-            Ok(_) => {
-                pb.set_position(file_size);
-                pb.finish_and_clear();
-                uploaded.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                pb.abandon_with_message(format!("失败: {}", truncate_name(&msg, 40)));
-                failed.fetch_add(1, Ordering::Relaxed);
-                failed_files.lock().unwrap().push((format!("↑ {}", local.display()), msg));
-            }
-        }
-        overall_pb.inc(1);
-        overall_pb.set_message(format!(
-            "↑{} ↓{}", uploaded.load(Ordering::Relaxed), downloaded.load(Ordering::Relaxed),
-        ));
-    });
+    prefix: String,
+    local_only: bool,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(scan_dir_inner(ctx, local_dir, cloud_dir, prefix, local_only))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn spawn_download(
-    join_set: &mut tokio::task::JoinSet<()>,
-    client: &Yun139Client,
-    cloud_path: String,
-    local: PathBuf,
-    est_size: u64,
-    parallel: usize,
-    uploaded: &Arc<AtomicU32>,
-    downloaded: &Arc<AtomicU32>,
-    failed: &Arc<AtomicU32>,
-    failed_files: &Arc<std::sync::Mutex<Vec<(String, String)>>>,
-    mp: &MultiProgress,
-    overall_pb: &ProgressBar,
-    task_style: &ProgressStyle,
+async fn scan_dir_inner(
+    ctx: Arc<SyncCtx>,
+    local_dir: PathBuf,
+    cloud_dir: String,
+    prefix: String,
+    local_only: bool,
 ) {
-    let client = client.clone();
-    let uploaded = uploaded.clone();
-    let downloaded = downloaded.clone();
-    let failed = failed.clone();
-    let failed_files = failed_files.clone();
-    let mp = mp.clone();
-    let overall_pb = overall_pb.clone();
-    let task_style = task_style.clone();
+    ctx.scan_pb.set_message(if prefix.is_empty() {
+        "/".to_string()
+    } else {
+        truncate_name(&prefix, 50)
+    });
 
-    join_set.spawn(async move {
-        // resolve path → download URL
-        let (url, size) = match async {
-            let item = client.resolve_path(&cloud_path).await?;
-            let s = item.size.unwrap_or(0) as u64;
-            let fid = item.file_id.as_deref().unwrap_or_default();
-            let url = client.get_download_url(fid).await?;
-            Ok::<_, Yun139Error>((url, s))
-        }.await {
-            Ok(v) => v,
-            Err(e) => {
-                let msg = e.to_string();
-                tracing::error!(err = %msg, file = %cloud_path, "resolve/download_url failed");
-                failed.fetch_add(1, Ordering::Relaxed);
-                failed_files.lock().unwrap().push((format!("↓ {cloud_path}"), msg));
-                overall_pb.inc(1);
-                return;
+    // 并行获取本地和云盘列表
+    let ld = local_dir.clone();
+    let local_handle = tokio::task::spawn_blocking(move || read_local_dir(&ld));
+
+    let cloud_items = if local_only {
+        Vec::new()
+    } else {
+        ctx.client.list_all_quiet(&cloud_dir).await.unwrap_or_default()
+    };
+
+    let local_entries = local_handle.await.unwrap_or_default();
+
+    let local_map: HashMap<&str, &LocalEntry> =
+        local_entries.iter().map(|e| (e.name.as_str(), e)).collect();
+    let cloud_map: HashMap<&str, &ListItem> =
+        cloud_items.iter().map(|e| (e.name.as_str(), e)).collect();
+
+    let ct = &ctx.cloud_root;
+
+    match ctx.direction {
+        SyncDirection::LocalToCloud => {
+            // 子目录：递归 spawn（无限扩散）
+            let mut sub_handles = Vec::new();
+            for le in local_entries.iter().filter(|e| e.is_dir) {
+                let cloud_path = rel_cloud(ct, &prefix, &le.name);
+                let is_new = !cloud_map.contains_key(le.name.as_str());
+                if is_new {
+                    ctx.scan_pb.set_message(format!("📁 {cloud_path}"));
+                    match ctx.client.ensure_dir(&cloud_path).await {
+                        Ok(_) => { ctx.dirs_created.fetch_add(1, Ordering::Relaxed); }
+                        Err(e) => {
+                            tracing::error!(err = %e, dir = %cloud_path, "mkdir cloud failed");
+                            ctx.failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                let ctx2 = ctx.clone();
+                let sub_local = local_dir.join(&le.name);
+                let sub_prefix = rel_path(&prefix, &le.name);
+                sub_handles.push(tokio::spawn(async move {
+                    scan_dir(ctx2, sub_local, cloud_path, sub_prefix, is_new).await;
+                }));
             }
-        };
 
-        let actual_size = if size > 0 { size } else { est_size };
-        let pb = mp.insert_before(&overall_pb, ProgressBar::new(actual_size));
-        pb.set_style(task_style);
-        let name = cloud_path.rsplit('/').next().unwrap_or(&cloud_path);
-        pb.set_prefix(format!("↓ {}", truncate_name(name, 28)));
-
-        let pb2 = pb.clone();
-        let result = client.download_parallel(&url, &local, parallel, move |bytes, _| {
-            pb2.set_position(bytes);
-        }).await;
-
-        match result {
-            Ok(_) => {
-                pb.finish_and_clear();
-                downloaded.fetch_add(1, Ordering::Relaxed);
+            // 文件：对比 size → spawn 上传
+            for le in local_entries.iter().filter(|e| !e.is_dir) {
+                let need = match cloud_map.get(le.name.as_str()) {
+                    None => true,
+                    Some(ci) => ci.size != le.size as i64,
+                };
+                if need {
+                    ctx.overall_pb.inc_length(1);
+                    let local = local_dir.join(&le.name);
+                    let cloud = cloud_dir.clone();
+                    push_upload(&ctx, local, cloud).await;
+                } else {
+                    ctx.skipped.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            Err(e) => {
-                let msg = e.to_string();
-                pb.abandon_with_message(format!("失败: {}", truncate_name(&msg, 40)));
-                failed.fetch_add(1, Ordering::Relaxed);
-                failed_files.lock().unwrap().push((format!("↓ {cloud_path}"), msg));
+
+            // 删除收集
+            if ctx.delete {
+                for ci in &cloud_items {
+                    if !local_map.contains_key(ci.name.as_str()) {
+                        let cloud = rel_cloud(ct, &prefix, &ci.name);
+                        if ci.is_folder {
+                            collect_cloud_deletes(&ctx.client, &cloud, &ctx.pending_deletes).await;
+                        }
+                        ctx.pending_deletes.lock().await.push(SyncAction::DeleteCloud { cloud });
+                    }
+                }
+            }
+
+            // 等待子目录 scan 完成
+            for h in sub_handles {
+                let _ = h.await;
             }
         }
-        overall_pb.inc(1);
-        overall_pb.set_message(format!(
-            "↑{} ↓{}", uploaded.load(Ordering::Relaxed), downloaded.load(Ordering::Relaxed),
-        ));
-    });
+        SyncDirection::CloudToLocal => {
+            let mut sub_handles = Vec::new();
+            for ci in cloud_items.iter().filter(|e| e.is_folder) {
+                let is_new = !local_map.contains_key(ci.name.as_str());
+                if is_new {
+                    let lp = local_dir.join(&ci.name);
+                    ctx.scan_pb.set_message(format!("📁 {}", lp.display()));
+                    match tokio::fs::create_dir_all(&lp).await {
+                        Ok(_) => { ctx.dirs_created.fetch_add(1, Ordering::Relaxed); }
+                        Err(e) => {
+                            tracing::error!(err = %e, dir = %lp.display(), "mkdir local failed");
+                            ctx.failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                let ctx2 = ctx.clone();
+                let sub_local = local_dir.join(&ci.name);
+                let sub_cloud = rel_cloud(ct, &prefix, &ci.name);
+                let sub_prefix = rel_path(&prefix, &ci.name);
+                sub_handles.push(tokio::spawn(async move {
+                    scan_dir(ctx2, sub_local, sub_cloud, sub_prefix, false).await;
+                }));
+            }
+
+            for ci in cloud_items.iter().filter(|e| !e.is_folder) {
+                let need = match local_map.get(ci.name.as_str()) {
+                    None => true,
+                    Some(le) => le.size as i64 != ci.size,
+                };
+                if need {
+                    ctx.overall_pb.inc_length(1);
+                    let cloud = rel_cloud(ct, &prefix, &ci.name);
+                    let local = local_dir.join(&ci.name);
+                    push_download(&ctx, cloud, local, ci.size as u64).await;
+                } else {
+                    ctx.skipped.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+
+            if ctx.delete {
+                for le in &local_entries {
+                    if !cloud_map.contains_key(le.name.as_str()) {
+                        ctx.pending_deletes.lock().await.push(SyncAction::DeleteLocal {
+                            local: local_dir.join(&le.name),
+                        });
+                    }
+                }
+            }
+
+            for h in sub_handles {
+                let _ = h.await;
+            }
+        }
+    }
 }
 
-// ── 递归收集云盘删除条目 ──
+// ── JoinSet push + 背压 ──
 
-/// 递归扫描云盘目录，将所有子文件和子目录收集为 DeleteCloud 动作。
-/// 子文件先于子目录（保证删除顺序：文件先删，目录后删）。
-async fn collect_cloud_deletes_recursive(
+/// 推入上传任务到 JoinSet，满了就等一个完成。
+async fn push_upload(ctx: &Arc<SyncCtx>, local: PathBuf, cloud_dir: String) {
+    // 背压
+    {
+        let mut js = ctx.join_set.lock().await;
+        while js.len() >= ctx.parallel {
+            // 释放锁再等
+            drop(js);
+            tokio::task::yield_now().await;
+            let mut js2 = ctx.join_set.lock().await;
+            // try drain one
+            if js2.len() >= ctx.parallel {
+                js2.join_next().await;
+            }
+            drop(js2);
+            js = ctx.join_set.lock().await;
+        }
+
+        let ctx2 = ctx.clone();
+        let sem = ctx.transfer_sem.clone();
+        js.spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            do_upload_task(&ctx2, local, cloud_dir).await;
+        });
+    }
+}
+
+/// 推入下载任务到 JoinSet，满了就等一个完成。
+async fn push_download(ctx: &Arc<SyncCtx>, cloud: String, local: PathBuf, est_size: u64) {
+    {
+        let mut js = ctx.join_set.lock().await;
+        while js.len() >= ctx.parallel {
+            drop(js);
+            tokio::task::yield_now().await;
+            let mut js2 = ctx.join_set.lock().await;
+            if js2.len() >= ctx.parallel {
+                js2.join_next().await;
+            }
+            drop(js2);
+            js = ctx.join_set.lock().await;
+        }
+
+        let ctx2 = ctx.clone();
+        let sem = ctx.transfer_sem.clone();
+        let parallel = ctx.parallel;
+        js.spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            do_download_task(&ctx2, cloud, local, est_size, parallel).await;
+        });
+    }
+}
+
+// ── 传输任务实现 ──
+
+async fn do_upload_task(ctx: &SyncCtx, local: PathBuf, cloud_dir: String) {
+    let file_size = tokio::fs::metadata(&local).await.map(|m| m.len()).unwrap_or(0);
+    let pb = ctx.mp.insert_before(&ctx.overall_pb, ProgressBar::new(file_size));
+    pb.set_style(ctx.task_style.clone());
+    let name = local.file_name().unwrap_or_default().to_string_lossy().to_string();
+    pb.set_prefix(format!("↑ {}", truncate_name(&name, 28)));
+
+    let pb2 = pb.clone();
+    match ctx.client.upload_file(&local, &cloud_dir, move |bytes, _| { pb2.set_position(bytes); }).await {
+        Ok(_) => {
+            pb.set_position(file_size);
+            pb.finish_and_clear();
+            ctx.uploaded.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            pb.abandon_with_message(format!("失败: {}", truncate_name(&msg, 40)));
+            ctx.failed.fetch_add(1, Ordering::Relaxed);
+            ctx.failed_files.lock().unwrap().push((format!("↑ {}", local.display()), msg));
+        }
+    }
+    ctx.overall_pb.inc(1);
+    ctx.overall_pb.set_message(format!(
+        "↑{} ↓{}", ctx.uploaded.load(Ordering::Relaxed), ctx.downloaded.load(Ordering::Relaxed),
+    ));
+}
+
+async fn do_download_task(ctx: &SyncCtx, cloud: String, local: PathBuf, est_size: u64, parallel: usize) {
+    let (url, size) = match async {
+        let item = ctx.client.resolve_path(&cloud).await?;
+        let s = item.size.unwrap_or(0) as u64;
+        let fid = item.file_id.as_deref().unwrap_or_default();
+        let url = ctx.client.get_download_url(fid).await?;
+        Ok::<_, Yun139Error>((url, s))
+    }.await {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = e.to_string();
+            tracing::error!(err = %msg, file = %cloud, "resolve failed");
+            ctx.failed.fetch_add(1, Ordering::Relaxed);
+            ctx.failed_files.lock().unwrap().push((format!("↓ {cloud}"), msg));
+            ctx.overall_pb.inc(1);
+            return;
+        }
+    };
+
+    let actual = if size > 0 { size } else { est_size };
+    let pb = ctx.mp.insert_before(&ctx.overall_pb, ProgressBar::new(actual));
+    pb.set_style(ctx.task_style.clone());
+    let name = cloud.rsplit('/').next().unwrap_or(&cloud);
+    pb.set_prefix(format!("↓ {}", truncate_name(name, 28)));
+
+    let pb2 = pb.clone();
+    match ctx.client.download_parallel(&url, &local, parallel, move |bytes, _| {
+        pb2.set_position(bytes);
+    }).await {
+        Ok(_) => {
+            pb.finish_and_clear();
+            ctx.downloaded.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            pb.abandon_with_message(format!("失败: {}", truncate_name(&msg, 40)));
+            ctx.failed.fetch_add(1, Ordering::Relaxed);
+            ctx.failed_files.lock().unwrap().push((format!("↓ {cloud}"), msg));
+        }
+    }
+    ctx.overall_pb.inc(1);
+    ctx.overall_pb.set_message(format!(
+        "↑{} ↓{}", ctx.uploaded.load(Ordering::Relaxed), ctx.downloaded.load(Ordering::Relaxed),
+    ));
+}
+
+// ── 递归收集云盘删除 ──
+
+async fn collect_cloud_deletes(
     client: &Yun139Client,
     cloud_dir: &str,
-    pending: &mut Vec<SyncAction>,
+    pending: &TokioMutex<Vec<SyncAction>>,
 ) {
     let items = match client.list_all_quiet(cloud_dir).await {
         Ok(items) => items,
         Err(_) => return,
     };
-
     for item in &items {
-        let child_path = format!("{}/{}", cloud_dir.trim_end_matches('/'), item.name);
+        let child = format!("{}/{}", cloud_dir.trim_end_matches('/'), item.name);
         if item.is_folder {
-            // 先递归子目录
-            Box::pin(collect_cloud_deletes_recursive(client, &child_path, pending)).await;
+            Box::pin(collect_cloud_deletes(client, &child, pending)).await;
         }
-        // 文件先，目录后（pending 排序会最终保证顺序）
-        pending.push(SyncAction::DeleteCloud { cloud: child_path });
+        pending.lock().await.push(SyncAction::DeleteCloud { cloud: child });
+    }
+}
+
+// ── Yun139Client 辅助 ──
+
+impl Yun139Client {
+    async fn list_all_quiet(&self, cloud_dir: &str) -> Result<Vec<ListItem>> {
+        match self.list_all(cloud_dir).await {
+            Ok(r) => Ok(r.items),
+            Err(_) => Ok(Vec::new()),
+        }
     }
 }
 
 // ── 工具函数 ──
 
-/// 读取单层本地目录条目。
 struct LocalEntry {
     name: String,
     is_dir: bool,
@@ -648,16 +665,4 @@ fn rel_path(prefix: &str, name: &str) -> String {
 
 fn rel_cloud(ct: &str, prefix: &str, name: &str) -> String {
     if prefix.is_empty() { format!("{ct}/{name}") } else { format!("{ct}/{prefix}/{name}") }
-}
-
-// ── Yun139Client 辅助: 静默 list_all ──
-
-impl Yun139Client {
-    /// list_all 但不在找不到目录时报错（新目录可能尚未存在）。
-    async fn list_all_quiet(&self, cloud_dir: &str) -> Result<Vec<ListItem>> {
-        match self.list_all(cloud_dir).await {
-            Ok(r) => Ok(r.items),
-            Err(_) => Ok(Vec::new()),
-        }
-    }
 }
