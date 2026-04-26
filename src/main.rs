@@ -104,9 +104,8 @@ enum Commands {
 async fn main() {
     let cli = Cli::parse();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(&cli.log)
-        .init();
+    // 日志初始化：--log CLI 优先，否则从 config 读取 log_level + log_file
+    let _log_guard = init_logging(&cli.log, cli.auth.is_some());
 
     // login / logout 不需要 auth
     match &cli.command {
@@ -157,6 +156,68 @@ async fn main() {
         Commands::Search { keyword, limit } =>
             do_search(&client, &keyword, limit).await,
     }
+}
+
+// ── 日志初始化 ──
+
+/// 初始化 tracing 日志。
+///
+/// 优先级: `--log` CLI > config.log_level > "warn"
+/// 如果 config.log_file 已设置，日志输出到文件（不干扰 indicatif 进度条）。
+/// 返回的 guard 必须保持存活直到程序结束（用于 non-blocking writer flush）。
+fn init_logging(cli_log: &str, _has_cli_auth: bool) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    // 尝试从 config 读取日志配置
+    let (config_level, config_file) = yun139::config::Config::load()
+        .map(|c| (c.log_level, c.log_file))
+        .unwrap_or(("warn".to_string(), None));
+
+    // --log 参数非默认值时优先使用 CLI 设置
+    let cli_is_default = cli_log == "yun139=info";
+    let filter = if !cli_is_default {
+        cli_log.to_string()
+    } else {
+        format!("yun139={config_level}")
+    };
+
+    match config_file {
+        Some(ref path) if !path.is_empty() => {
+            // 日志输出到文件
+            let expanded = shellexpand_tilde(path);
+            let log_path = std::path::Path::new(&expanded);
+            if let Some(parent) = log_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&expanded)
+                .expect("无法打开日志文件");
+            let (writer, guard) = tracing_appender::non_blocking(file);
+            tracing_subscriber::fmt()
+                .with_env_filter(&filter)
+                .with_writer(writer)
+                .with_ansi(false)
+                .init();
+            Some(guard)
+        }
+        _ => {
+            // 日志输出到 stderr（默认行为）
+            tracing_subscriber::fmt()
+                .with_env_filter(&filter)
+                .init();
+            None
+        }
+    }
+}
+
+/// 简单的 `~` 展开。
+fn shellexpand_tilde(path: &str) -> String {
+    if path.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return format!("{}/{}", home.display(), &path[2..]);
+        }
+    }
+    path.to_string()
 }
 
 // ── auth 解析 ──

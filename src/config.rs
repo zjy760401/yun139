@@ -40,6 +40,12 @@ pub struct Config {
     /// 并行传输数（下载并发、sync 并发共用）
     #[serde(default = "default_parallel")]
     pub parallel: usize,
+    /// 日志级别 (trace, debug, info, warn, error, off)
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+    /// 日志输出到文件路径（设置后 stderr 不输出日志，不干扰进度条）
+    #[serde(default)]
+    pub log_file: Option<String>,
     /// token 过期时间戳（毫秒）
     #[serde(default)]
     pub token_expire_time: Option<i64>,
@@ -50,6 +56,10 @@ pub struct Config {
 
 fn default_parallel() -> usize {
     DEFAULT_PARALLEL
+}
+
+fn default_log_level() -> String {
+    "warn".to_string()
 }
 
 impl Config {
@@ -126,6 +136,8 @@ impl Config {
             authorization: b64,
             account,
             parallel: DEFAULT_PARALLEL,
+            log_level: default_log_level(),
+            log_file: None,
             token_expire_time: expire_time,
             personal_cloud_host: None,
         })

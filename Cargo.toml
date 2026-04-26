@@ -30,6 +30,7 @@ digest = "0.11"
 sha2 = "0.11"
 clap = { version = "4", features = ["derive", "env"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 indicatif = "0.17"
 dirs = "6"
 
