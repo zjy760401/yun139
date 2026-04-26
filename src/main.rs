@@ -490,9 +490,13 @@ fn config_exclude(args: &[String]) {
             }, "exclude = (恢复默认)");
         }
         _ => {
-            eprintln!("未知操作: {cmd}");
-            eprintln!("用法: config exclude [add <p> | rm <p> | reset]");
-            std::process::exit(1);
+            // 非关键字直接当 add: yun139 config exclude "*.store"
+            let pattern = cmd.to_string();
+            update_config(|c| {
+                if !c.exclude.contains(&pattern) {
+                    c.exclude.push(pattern.clone());
+                }
+            }, &format!("exclude += {pattern}"));
         }
     }
 }
