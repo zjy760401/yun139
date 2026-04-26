@@ -1,7 +1,7 @@
 //! 集成测试：通过 CLI 命令测试上传 200MB 随机文件 → 下载 → SHA256 校验
 //!
 //! 每次运行生成全新随机内容，避免秒传命中，确保真实上传链路被测试。
-//! 测试直接调用编译好的 `yun139-cli` 二进制，验证端到端 CLI 工作流。
+//! 测试直接调用编译好的 `yun139` 二进制，验证端到端 CLI 工作流。
 //!
 //! 需要设置环境变量 `YUN139_AUTH` 才能运行。
 //!
@@ -22,10 +22,10 @@ fn get_auth() -> Option<String> {
 /// 获取 CLI 二进制路径（cargo test 编译产物同目录）
 fn cli_bin() -> std::path::PathBuf {
     let mut path = std::env::current_exe().expect("current_exe");
-    // tests binary 在 target/debug/deps/xxx, CLI 在 target/debug/yun139-cli
+    // tests binary 在 target/debug/deps/xxx, CLI 在 target/debug/yun139
     path.pop(); // deps/
     path.pop(); // debug/
-    path.push("yun139-cli");
+    path.push("yun139");
     path
 }
 
@@ -116,7 +116,7 @@ fn upload_download_roundtrip_via_cli() {
     eprintln!("   SHA256: {original_hash}");
 
     // ── Step 2: CLI upload ──
-    eprintln!("⬆️  yun139-cli upload {} {CLOUD_DIR}", upload_path.display());
+    eprintln!("⬆️  yun139 upload {} {CLOUD_DIR}", upload_path.display());
     let upload_output = Command::new(&bin)
         .args([
             "--auth",
@@ -142,7 +142,7 @@ fn upload_download_roundtrip_via_cli() {
     // ── Step 3: CLI download ──
     let cloud_file_path = format!("{CLOUD_DIR}/{file_name}");
     eprintln!(
-        "⬇️  yun139-cli download {cloud_file_path} {}",
+        "⬇️  yun139 download {cloud_file_path} {}",
         download_path.display()
     );
     let download_output = Command::new(&bin)

@@ -18,7 +18,7 @@ fn version_string() -> &'static str {
 /// 中国移动云盘 (139网盘) CLI
 #[derive(Parser)]
 #[command(
-    name = "yun139-cli",
+    name = "yun139",
     about = "139 云盘命令行工具",
 )]
 struct Cli {
@@ -303,13 +303,13 @@ fn resolve_auth_and_parallel() -> (String, usize) {
         Ok(config) => {
             if config.is_expired() {
                 eprintln!("⚠️  Token 已过期或即将过期，建议重新设置:");
-                eprintln!("   yun139-cli config token <新token>");
+                eprintln!("   yun139 config token <新token>");
             }
             (config.authorization_header(), config.parallel)
         }
         Err(yun139::config::ConfigError::NotFound) => {
             eprintln!("错误: 未找到配置文件");
-            eprintln!("  方式 1: yun139-cli config token <token>");
+            eprintln!("  方式 1: yun139 config token <token>");
             eprintln!("  方式 2: export YUN139_AUTH=<token>");
             std::process::exit(1);
         }
@@ -355,7 +355,7 @@ fn config_show() {
         }
         Err(yun139::config::ConfigError::NotFound) => {
             eprintln!("未配置。请先设置 token:");
-            eprintln!("  yun139-cli config token <token>");
+            eprintln!("  yun139 config token <token>");
         }
         Err(e) => {
             eprintln!("❌ {e}");
@@ -464,7 +464,7 @@ fn config_exclude(args: &[String]) {
     match cmd {
         "add" => {
             if args.len() < 2 {
-                eprintln!("用法: yun139-cli config exclude add <pattern>");
+                eprintln!("用法: yun139 config exclude add <pattern>");
                 std::process::exit(1);
             }
             let pattern = args[1].clone();
@@ -476,7 +476,7 @@ fn config_exclude(args: &[String]) {
         }
         "rm" | "remove" | "del" => {
             if args.len() < 2 {
-                eprintln!("用法: yun139-cli config exclude rm <pattern>");
+                eprintln!("用法: yun139 config exclude rm <pattern>");
                 std::process::exit(1);
             }
             let pattern = &args[1];
@@ -509,7 +509,7 @@ fn update_config(modify: impl FnOnce(&mut yun139::config::Config), display: &str
         }
         Err(yun139::config::ConfigError::NotFound) => {
             eprintln!("❌ 配置文件不存在，请先设置 token:");
-            eprintln!("   yun139-cli config token <token>");
+            eprintln!("   yun139 config token <token>");
             std::process::exit(1);
         }
         Err(e) => { eprintln!("❌ {e}"); std::process::exit(1); }
@@ -651,8 +651,8 @@ async fn do_sync(client: &yun139::Yun139Client, src: &str, dest: &str, delete: b
         }
         _ => {
             eprintln!("❌ sync 需要一端为本地路径，一端为 cloud: 前缀的云盘路径");
-            eprintln!("  示例: yun139-cli sync ./local cloud:/backup");
-            eprintln!("  示例: yun139-cli sync cloud:/backup ./local");
+            eprintln!("  示例: yun139 sync ./local cloud:/backup");
+            eprintln!("  示例: yun139 sync cloud:/backup ./local");
             std::process::exit(1);
         }
     };

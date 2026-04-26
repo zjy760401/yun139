@@ -19,7 +19,7 @@ pub enum ConfigError {
     TomlParse(#[from] toml::de::Error),
     #[error("TOML serialize error: {0}")]
     TomlSerialize(#[from] toml::ser::Error),
-    #[error("配置文件不存在，请先运行 `yun139-cli login`")]
+    #[error("配置文件不存在，请先运行 `yun139 login`")]
     NotFound,
     #[error("无法确定配置目录")]
     NoConfigDir,
