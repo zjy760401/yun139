@@ -22,14 +22,6 @@ fn version_string() -> &'static str {
     about = "139 云盘命令行工具",
 )]
 struct Cli {
-    /// Authorization 令牌（临时覆盖，优先于配置文件和环境变量）
-    #[arg(short, long, env = "YUN139_AUTH", global = true, hide_env_values = true)]
-    auth: Option<String>,
-
-    /// 并行数（临时覆盖配置文件中的 parallel）
-    #[arg(short, long, global = true)]
-    parallel: Option<usize>,
-
     #[command(subcommand)]
     command: Commands,
 }
@@ -113,40 +105,32 @@ enum ConfigAction {
     /// 显示当前配置
     Show,
 
-    /// 设置配置项
-    Set {
-        #[command(subcommand)]
-        item: ConfigSetItem,
-    },
-
-    /// 删除配置文件（登出）
-    Reset,
-}
-
-#[derive(Subcommand)]
-enum ConfigSetItem {
     /// 设置 Authorization Token
     Token {
         /// Token 值（Basic base64 格式，从浏览器开发者工具获取）
         value: String,
     },
+
     /// 设置并行传输数
     Parallel {
         /// 并行数（建议 4~32）
         value: usize,
     },
-    /// 设置日志级别
-    #[command(name = "log-level")]
-    LogLevel {
-        /// trace, debug, info, warn, error, off
+
+    /// 设置日志：传入级别（trace/debug/info/warn/error/off）或文件路径
+    ///
+    /// 示例:
+    ///   config log warn           — 设置日志级别为 warn
+    ///   config log ./log_tmp      — 日志输出到文件（自动转绝对路径）
+    ///   config log off            — 关闭日志
+    ///   config log ""             — 清除日志文件设置，恢复终端输出
+    Log {
+        /// 日志级别或文件路径
         value: String,
     },
-    /// 设置日志文件路径（设置后日志不输出到终端，不干扰进度条）
-    #[command(name = "log-file")]
-    LogFile {
-        /// 文件路径，如 ~/.config/yun139/yun139.log；传 "" 清除
-        value: String,
-    },
+
+    /// 删除配置文件（登出）
+    Reset,
 }
 
 #[tokio::main]
@@ -156,18 +140,17 @@ async fn main() {
         .get_matches();
     let cli = Cli::from_arg_matches(&matches).expect("parse CLI args");
 
-    // 日志初始化
-    let _log_guard = init_logging();
-
-    // config 子命令不需要 auth
+    // config 子命令不需要 auth 和日志
     if let Commands::Config { ref action } = cli.command {
         do_config(action);
         return;
     }
 
-    // 其余命令：解析 auth + parallel
-    let (auth, config_parallel) = resolve_auth_and_parallel(cli.auth.as_deref());
-    let parallel = cli.parallel.unwrap_or(config_parallel);
+    // 日志初始化（仅非 config 命令时）
+    let _log_guard = init_logging();
+
+    // 其余命令：从 config / 环境变量读取 auth + parallel
+    let (auth, parallel) = resolve_auth_and_parallel();
 
     let client = match yun139::Yun139Client::new(&auth) {
         Ok(c) => c,
@@ -219,9 +202,18 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
             if let Some(parent) = log_path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            let file = std::fs::OpenOptions::new()
-                .create(true).append(true).open(&expanded)
-                .expect("无法打开日志文件");
+            let file = match std::fs::OpenOptions::new()
+                .create(true).append(true).open(&expanded) {
+                Ok(f) => f,
+                Err(e) => {
+                    // 文件打不开，回退到 stderr
+                    eprintln!("⚠️  日志文件打开失败 ({e})，输出到终端");
+                    tracing_subscriber::fmt()
+                        .with_env_filter(&filter)
+                        .init();
+                    return None;
+                }
+            };
             let (writer, guard) = tracing_appender::non_blocking(file);
             tracing_subscriber::fmt()
                 .with_env_filter(&filter)
@@ -250,27 +242,30 @@ fn shellexpand_tilde(path: &str) -> String {
 
 // ── auth 解析 ──
 
-fn resolve_auth_and_parallel(cli_auth: Option<&str>) -> (String, usize) {
+/// 从 $YUN139_AUTH 或配置文件读取 auth + parallel。
+fn resolve_auth_and_parallel() -> (String, usize) {
     let default_p = yun139::config::DEFAULT_PARALLEL;
 
-    if let Some(auth) = cli_auth {
-        let p = yun139::config::Config::load().map(|c| c.parallel).unwrap_or(default_p);
-        return (auth.to_string(), p);
+    // 环境变量优先
+    if let Ok(env_auth) = std::env::var("YUN139_AUTH") {
+        if !env_auth.is_empty() {
+            let p = yun139::config::Config::load().map(|c| c.parallel).unwrap_or(default_p);
+            return (env_auth, p);
+        }
     }
 
     match yun139::config::Config::load() {
         Ok(config) => {
             if config.is_expired() {
                 eprintln!("⚠️  Token 已过期或即将过期，建议重新设置:");
-                eprintln!("   yun139-cli config set token <新token>");
+                eprintln!("   yun139-cli config token <新token>");
             }
             (config.authorization_header(), config.parallel)
         }
         Err(yun139::config::ConfigError::NotFound) => {
-            eprintln!("错误: 未提供令牌，且未找到配置文件");
-            eprintln!("  方式 1: yun139-cli config set token <token>");
-            eprintln!("  方式 2: yun139-cli -a <token> <cmd>");
-            eprintln!("  方式 3: export YUN139_AUTH=<token>");
+            eprintln!("错误: 未找到配置文件");
+            eprintln!("  方式 1: yun139-cli config token <token>");
+            eprintln!("  方式 2: export YUN139_AUTH=<token>");
             std::process::exit(1);
         }
         Err(e) => {
@@ -285,7 +280,9 @@ fn resolve_auth_and_parallel(cli_auth: Option<&str>) -> (String, usize) {
 fn do_config(action: &ConfigAction) {
     match action {
         ConfigAction::Show => config_show(),
-        ConfigAction::Set { item } => config_set(item),
+        ConfigAction::Token { value } => config_token(value),
+        ConfigAction::Parallel { value } => config_parallel(*value),
+        ConfigAction::Log { value } => config_log(value),
         ConfigAction::Reset => config_reset(),
     }
 }
@@ -311,7 +308,7 @@ fn config_show() {
         }
         Err(yun139::config::ConfigError::NotFound) => {
             eprintln!("未配置。请先设置 token:");
-            eprintln!("  yun139-cli config set token <token>");
+            eprintln!("  yun139-cli config token <token>");
         }
         Err(e) => {
             eprintln!("❌ {e}");
@@ -320,51 +317,78 @@ fn config_show() {
     }
 }
 
-fn config_set(item: &ConfigSetItem) {
-    match item {
-        ConfigSetItem::Token { value } => {
-            match yun139::config::Config::from_token(value) {
-                Ok(mut new_config) => {
-                    // 保留旧配置中的非 token 设置
-                    if let Ok(old) = yun139::config::Config::load() {
-                        new_config.parallel = old.parallel;
-                        new_config.log_level = old.log_level;
-                        new_config.log_file = old.log_file;
-                        new_config.personal_cloud_host = old.personal_cloud_host;
-                    }
-                    match new_config.save() {
-                        Ok(path) => {
-                            eprintln!("✅ Token 已保存");
-                            eprintln!("   账号: {}", new_config.account);
-                            eprintln!("   过期: {}", new_config.expire_time_display());
-                            eprintln!("   配置: {}", path.display());
-                        }
-                        Err(e) => { eprintln!("❌ 保存失败: {e}"); std::process::exit(1); }
-                    }
+fn config_token(value: &str) {
+    match yun139::config::Config::from_token(value) {
+        Ok(mut new_config) => {
+            if let Ok(old) = yun139::config::Config::load() {
+                new_config.parallel = old.parallel;
+                new_config.log_level = old.log_level;
+                new_config.log_file = old.log_file;
+                new_config.personal_cloud_host = old.personal_cloud_host;
+            }
+            match new_config.save() {
+                Ok(path) => {
+                    eprintln!("✅ Token 已保存");
+                    eprintln!("   账号: {}", new_config.account);
+                    eprintln!("   过期: {}", new_config.expire_time_display());
+                    eprintln!("   配置: {}", path.display());
                 }
-                Err(e) => { eprintln!("❌ Token 无效: {e}"); std::process::exit(1); }
+                Err(e) => { eprintln!("❌ 保存失败: {e}"); std::process::exit(1); }
             }
         }
-        ConfigSetItem::Parallel { value } => {
-            update_config(|c| { c.parallel = *value; }, &format!("parallel = {value}"));
-        }
-        ConfigSetItem::LogLevel { value } => {
-            let valid = ["trace", "debug", "info", "warn", "error", "off"];
-            if !valid.contains(&value.as_str()) {
-                eprintln!("❌ 无效的日志级别: {value}");
-                eprintln!("   可选值: {}", valid.join(", "));
-                std::process::exit(1);
-            }
-            update_config(|c| { c.log_level = value.clone(); }, &format!("log_level = {value}"));
-        }
-        ConfigSetItem::LogFile { value } => {
-            if value.is_empty() {
-                update_config(|c| { c.log_file = None; }, "log_file = (已清除)");
-            } else {
-                update_config(|c| { c.log_file = Some(value.clone()); }, &format!("log_file = {value}"));
-            }
+        Err(e) => { eprintln!("❌ Token 无效: {e}"); std::process::exit(1); }
+    }
+}
+
+fn config_parallel(value: usize) {
+    update_config(|c| { c.parallel = value; }, &format!("parallel = {value}"));
+}
+
+/// 日志设置：值是级别名 → 设置 log_level；是路径 → 设置 log_file（自动转绝对路径）；空串 → 清除 log_file。
+fn config_log(value: &str) {
+    const LOG_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error", "off"];
+
+    // 空串或引号包裹的空串 → 清除 log_file
+    let trimmed = value.trim().trim_matches('"').trim_matches('\'');
+    if trimmed.is_empty() {
+        update_config(|c| { c.log_file = None; }, "log_file = (已清除，恢复终端输出)");
+    } else if LOG_LEVELS.contains(&trimmed.to_lowercase().as_str()) {
+        let level = trimmed.to_lowercase();
+        update_config(|c| { c.log_level = level.clone(); }, &format!("log_level = {level}"));
+    } else {
+        // 当作文件路径处理 → 转绝对路径
+        let abs = to_absolute_path(trimmed);
+        update_config(|c| { c.log_file = Some(abs.clone()); }, &format!("log_file = {abs}"));
+    }
+}
+
+/// 将路径转为干净的绝对路径（展开 ~ 和相对路径，清理 ./）。
+fn to_absolute_path(path: &str) -> String {
+    let expanded = shellexpand_tilde(path);
+    let p = std::path::Path::new(&expanded);
+
+    // 先尝试 canonicalize（路径已存在时能解析符号链接和 ./ ../ ）
+    if let Ok(abs) = p.canonicalize() {
+        return abs.to_string_lossy().to_string();
+    }
+
+    // 路径不存在时手动拼接
+    let full = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(p)
+    };
+
+    // 用 components() 清理 ./ ../ 等冗余部分
+    let mut clean = std::path::PathBuf::new();
+    for comp in full.components() {
+        match comp {
+            std::path::Component::CurDir => {} // 跳过 .
+            std::path::Component::ParentDir => { clean.pop(); }
+            other => { clean.push(other); }
         }
     }
+    clean.to_string_lossy().to_string()
 }
 
 /// 加载现有 config → 修改 → 保存。
@@ -379,7 +403,7 @@ fn update_config(modify: impl FnOnce(&mut yun139::config::Config), display: &str
         }
         Err(yun139::config::ConfigError::NotFound) => {
             eprintln!("❌ 配置文件不存在，请先设置 token:");
-            eprintln!("   yun139-cli config set token <token>");
+            eprintln!("   yun139-cli config token <token>");
             std::process::exit(1);
         }
         Err(e) => { eprintln!("❌ {e}"); std::process::exit(1); }
