@@ -39,17 +39,23 @@ pub enum SyncDirection {
 pub struct SyncOptions {
     pub delete: bool,
     pub concurrency: usize,
+    /// 仅上传（跳过下载）
+    pub upload_only: bool,
+    /// 仅下载（跳过上传）
+    pub download_only: bool,
 }
 
 impl Default for SyncOptions {
     fn default() -> Self {
-        Self { delete: false, concurrency: DEFAULT_PARALLEL }
+        Self { delete: false, concurrency: DEFAULT_PARALLEL, upload_only: false, download_only: false }
     }
 }
 
 impl SyncOptions {
     pub fn with_delete(mut self, v: bool) -> Self { self.delete = v; self }
     pub fn with_concurrency(mut self, n: usize) -> Self { self.concurrency = n.max(1); self }
+    pub fn with_upload_only(mut self, v: bool) -> Self { self.upload_only = v; self }
+    pub fn with_download_only(mut self, v: bool) -> Self { self.download_only = v; self }
 }
 
 /// 单条同步动作（仅用于删除的延迟执行）。
@@ -116,6 +122,8 @@ struct SyncCtx {
     client: Yun139Client,
     direction: SyncDirection,
     delete: bool,
+    upload_only: bool,
+    download_only: bool,
     cloud_root: String,
     parallel: usize,
     /// 排除的文件名模式
@@ -192,6 +200,8 @@ async fn streaming_sync(
         client: client.clone(),
         direction,
         delete: opts.delete,
+        upload_only: opts.upload_only,
+        download_only: opts.download_only,
         cloud_root: ct.clone(),
         parallel: p,
         exclude,
@@ -433,7 +443,11 @@ async fn scan_dir_inner(
                 }
             }
 
-            // ── Phase B: 更新进度条 ──
+            // ── Phase B: 更新进度条（download_only 时跳过上传） ──
+            if ctx.download_only {
+                ctx.skipped.fetch_add(to_upload.len() as u32, Ordering::Relaxed);
+                to_upload.clear();
+            }
             if !to_upload.is_empty() {
                 ctx.overall_pb.inc_length(to_upload.len() as u64);
             }
@@ -551,7 +565,11 @@ async fn scan_dir_inner(
                 }
             }
 
-            // ── Phase B: 更新进度条 ──
+            // ── Phase B: 更新进度条（upload_only 时跳过下载） ──
+            if ctx.upload_only {
+                ctx.skipped.fetch_add(to_download.len() as u32, Ordering::Relaxed);
+                to_download.clear();
+            }
             if !to_download.is_empty() {
                 ctx.overall_pb.inc_length(to_download.len() as u64);
             }

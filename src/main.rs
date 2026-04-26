@@ -88,6 +88,12 @@ enum Commands {
         /// 删除目标中源没有的文件
         #[arg(long)]
         delete: bool,
+        /// 仅上传（跳过下载）
+        #[arg(long, conflicts_with = "download_only")]
+        upload_only: bool,
+        /// 仅下载（跳过上传）
+        #[arg(long, conflicts_with = "upload_only")]
+        download_only: bool,
     },
 
     /// 搜索云盘文件
@@ -198,8 +204,8 @@ async fn main() {
         Commands::Delete { cloud_path, permanent } =>
             do_delete(&client, &cloud_path, permanent).await,
 
-        Commands::Sync { src, dest, delete } =>
-            do_sync(&client, &src, &dest, delete, parallel).await,
+        Commands::Sync { src, dest, delete, upload_only, download_only } =>
+            do_sync(&client, &src, &dest, delete, upload_only, download_only, parallel).await,
 
         Commands::Search { keyword, limit } =>
             do_search(&client, &keyword, limit).await,
@@ -633,12 +639,14 @@ async fn do_delete(client: &yun139::Yun139Client, cloud_path: &str, permanent: b
 
 // ── sync ──
 
-async fn do_sync(client: &yun139::Yun139Client, src: &str, dest: &str, delete: bool, parallel: usize) {
+async fn do_sync(client: &yun139::Yun139Client, src: &str, dest: &str, delete: bool, upload_only: bool, download_only: bool, parallel: usize) {
     let src_is_cloud = src.starts_with("cloud:");
     let dest_is_cloud = dest.starts_with("cloud:");
     let opts = yun139::SyncOptions::default()
         .with_delete(delete)
-        .with_concurrency(parallel);
+        .with_concurrency(parallel)
+        .with_upload_only(upload_only)
+        .with_download_only(download_only);
 
     let result = match (src_is_cloud, dest_is_cloud) {
         (false, true) => {
