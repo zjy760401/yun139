@@ -137,6 +137,14 @@ enum ConfigAction {
 async fn main() {
     let matches = Cli::command()
         .version(version_string())
+        .disable_version_flag(true)
+        .arg(
+            clap::Arg::new("version")
+                .short('v')
+                .long("version")
+                .action(clap::ArgAction::Version)
+                .help("显示版本号"),
+        )
         .get_matches();
     let cli = Cli::from_arg_matches(&matches).expect("parse CLI args");
 
@@ -197,16 +205,14 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
 
     match file {
         Some(ref path) if !path.is_empty() => {
-            let expanded = shellexpand_tilde(path);
-            let log_path = std::path::Path::new(&expanded);
-            if let Some(parent) = log_path.parent() {
+            let log_file = resolve_log_file_path(path);
+            if let Some(parent) = std::path::Path::new(&log_file).parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
             let file = match std::fs::OpenOptions::new()
-                .create(true).append(true).open(&expanded) {
+                .create(true).append(true).open(&log_file) {
                 Ok(f) => f,
                 Err(e) => {
-                    // 文件打不开，回退到 stderr
                     eprintln!("⚠️  日志文件打开失败 ({e})，输出到终端");
                     tracing_subscriber::fmt()
                         .with_env_filter(&filter)
@@ -238,6 +244,33 @@ fn shellexpand_tilde(path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+const DEFAULT_LOG_FILENAME: &str = "yun139.log";
+
+/// 将日志路径解析为最终文件路径。
+///
+/// - 已存在的目录 / 以 `/` 结尾 / 无扩展名 → 当作目录，追加 `yun139.log`
+/// - 有扩展名（如 `.log`）→ 当作文件
+/// - 不存在且无扩展名 → 当作目录，创建后追加 `yun139.log`
+fn resolve_log_file_path(raw: &str) -> String {
+    let expanded = shellexpand_tilde(raw);
+    let p = std::path::Path::new(&expanded);
+
+    // 明确是目录：已存在的目录 或 以 / 结尾
+    if p.is_dir() || expanded.ends_with('/') || expanded.ends_with('\\') {
+        let _ = std::fs::create_dir_all(p);
+        return p.join(DEFAULT_LOG_FILENAME).to_string_lossy().to_string();
+    }
+
+    // 有扩展名 → 当作文件
+    if p.extension().is_some() {
+        return expanded;
+    }
+
+    // 无扩展名、不存在 → 当作目录
+    let _ = std::fs::create_dir_all(p);
+    p.join(DEFAULT_LOG_FILENAME).to_string_lossy().to_string()
 }
 
 // ── auth 解析 ──
@@ -356,9 +389,10 @@ fn config_log(value: &str) {
         let level = trimmed.to_lowercase();
         update_config(|c| { c.log_level = level.clone(); }, &format!("log_level = {level}"));
     } else {
-        // 当作文件路径处理 → 转绝对路径
+        // 当作文件/目录路径处理 → 转绝对路径 → 解析为最终文件路径
         let abs = to_absolute_path(trimmed);
-        update_config(|c| { c.log_file = Some(abs.clone()); }, &format!("log_file = {abs}"));
+        let resolved = resolve_log_file_path(&abs);
+        update_config(|c| { c.log_file = Some(resolved.clone()); }, &format!("log_file = {resolved}"));
     }
 }
 

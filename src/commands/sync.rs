@@ -5,13 +5,13 @@
 //! ```text
 //!   scan (递归 spawn，无并行度限制)
 //!     ├─ 子目录 → tokio::spawn(scan_dir)     ← 无限扩散
-//!     ├─ 文件上传/下载 → JoinSet.spawn()      ← JoinSet 背压 = P
-//!     │    └─ upload/download 内部分片         ← Semaphore = P
+//!     ├─ 文件上传/下载 → JoinSet.spawn()      ← 不限大小
+//!     │    └─ acquire Semaphore permit         ← 并发 = P
 //!     └─ 删除 → pending_deletes
 //!
-//!   JoinSet 并行度 = config.parallel (P)
-//!   Semaphore 并行度 = config.parallel (P)
-//!   总并行度 ≈ P × 2
+//!   JoinSet: 只负责 spawn + drain，不限大小
+//!   Semaphore(P): 控制同时执行的传输数 = config.parallel
+//!   总并行度 = P（信号量独控）
 //! ```
 
 use std::collections::HashMap;
@@ -516,58 +516,29 @@ async fn scan_dir_inner(
     }
 }
 
-// ── JoinSet push + 背压 ──
+// ── JoinSet push（无背压，并发由 Semaphore 独控） ──
 
-/// 推入上传任务到 JoinSet，满了就等一个完成。
+/// 推入上传任务到 JoinSet。并发由 transfer_sem 控制。
 async fn push_upload(ctx: &Arc<SyncCtx>, local: PathBuf, cloud_dir: String) {
-    // 背压
-    {
-        let mut js = ctx.join_set.lock().await;
-        while js.len() >= ctx.parallel {
-            // 释放锁再等
-            drop(js);
-            tokio::task::yield_now().await;
-            let mut js2 = ctx.join_set.lock().await;
-            // try drain one
-            if js2.len() >= ctx.parallel {
-                js2.join_next().await;
-            }
-            drop(js2);
-            js = ctx.join_set.lock().await;
-        }
-
-        let ctx2 = ctx.clone();
-        let sem = ctx.transfer_sem.clone();
-        js.spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
-            do_upload_task(&ctx2, local, cloud_dir).await;
-        });
-    }
+    let ctx2 = ctx.clone();
+    let sem = ctx.transfer_sem.clone();
+    let mut js = ctx.join_set.lock().await;
+    js.spawn(async move {
+        let _permit = sem.acquire().await.unwrap();
+        do_upload_task(&ctx2, local, cloud_dir).await;
+    });
 }
 
-/// 推入下载任务到 JoinSet，满了就等一个完成。
+/// 推入下载任务到 JoinSet。并发由 transfer_sem 控制。
 async fn push_download(ctx: &Arc<SyncCtx>, cloud: String, local: PathBuf, est_size: u64) {
-    {
-        let mut js = ctx.join_set.lock().await;
-        while js.len() >= ctx.parallel {
-            drop(js);
-            tokio::task::yield_now().await;
-            let mut js2 = ctx.join_set.lock().await;
-            if js2.len() >= ctx.parallel {
-                js2.join_next().await;
-            }
-            drop(js2);
-            js = ctx.join_set.lock().await;
-        }
-
-        let ctx2 = ctx.clone();
-        let sem = ctx.transfer_sem.clone();
-        let parallel = ctx.parallel;
-        js.spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
-            do_download_task(&ctx2, cloud, local, est_size, parallel).await;
-        });
-    }
+    let ctx2 = ctx.clone();
+    let sem = ctx.transfer_sem.clone();
+    let parallel = ctx.parallel;
+    let mut js = ctx.join_set.lock().await;
+    js.spawn(async move {
+        let _permit = sem.acquire().await.unwrap();
+        do_download_task(&ctx2, cloud, local, est_size, parallel).await;
+    });
 }
 
 // ── 传输任务实现 ──
