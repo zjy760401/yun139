@@ -3,15 +3,15 @@
 //! **并行模型**:
 //!
 //! ```text
-//!   scan (递归 spawn，无并行度限制)
-//!     ├─ 子目录 → tokio::spawn(scan_dir)     ← 无限扩散
+//!   scan (递归 spawn)
+//!     ├─ 子目录 → tokio::spawn(scan_dir)     ← scan_sem(P) 控制
 //!     ├─ 文件上传/下载 → JoinSet.spawn()      ← 不限大小
-//!     │    └─ acquire Semaphore permit         ← 并发 = P
+//!     │    └─ acquire transfer_sem permit      ← transfer_sem(P) 控制
 //!     └─ 删除 → pending_deletes
 //!
-//!   JoinSet: 只负责 spawn + drain，不限大小
-//!   Semaphore(P): 控制同时执行的传输数 = config.parallel
-//!   总并行度 = P（信号量独控）
+//!   scan_sem(P):     控制同时扫描的目录数
+//!   transfer_sem(P): 控制同时执行的传输数
+//!   总并行度 ≈ P(scan) + P(transfer) = 2P
 //! ```
 
 use std::collections::HashMap;
@@ -121,8 +121,10 @@ struct SyncCtx {
 
     // JoinSet（TokioMutex 保护，因为多个 scan 协程会并发 push）
     join_set: TokioMutex<tokio::task::JoinSet<()>>,
-    // 分片传输信号量（upload/download 内部的分片并发）
+    // 传输信号量（控制同时执行的上传/下载数）
     transfer_sem: Arc<tokio::sync::Semaphore>,
+    // 扫描信号量（控制同时扫描的目录数）
+    scan_sem: Arc<tokio::sync::Semaphore>,
 
     // 延迟删除（scan 完毕后串行执行）
     pending_deletes: TokioMutex<Vec<SyncAction>>,
@@ -187,6 +189,7 @@ async fn streaming_sync(
         parallel: p,
         join_set: TokioMutex::new(tokio::task::JoinSet::new()),
         transfer_sem: Arc::new(tokio::sync::Semaphore::new(p)),
+        scan_sem: Arc::new(tokio::sync::Semaphore::new(p)),
         pending_deletes: TokioMutex::new(Vec::new()),
         uploaded: Arc::new(AtomicU32::new(0)),
         downloaded: Arc::new(AtomicU32::new(0)),
@@ -325,6 +328,9 @@ async fn scan_dir_inner(
     prefix: String,
     local_only: bool,
 ) {
+    // 获取扫描 permit（控制同时扫描的目录数）
+    let _scan_permit = ctx.scan_sem.acquire().await.unwrap();
+
     ctx.scan_pb.set_message(if prefix.is_empty() {
         "/".to_string()
     } else {
