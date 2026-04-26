@@ -692,12 +692,21 @@ fn read_local_dir(dir: &Path, exclude: &[String]) -> Vec<LocalEntry> {
 }
 
 /// 检查文件名是否匹配排除模式。
-/// 支持: 精确匹配、`*` 前缀通配（如 `._*`）、`.*` 隐藏文件通配。
+///
+/// 支持:
+///   精确匹配:   `.DS_Store`
+///   前缀通配:   `._*`    → 匹配 `._Photo.jpg` 等
+///   后缀通配:   `*.store` → 匹配 `abc.store` 等
+///   隐藏文件:   `.*`     → 匹配所有 `.` 开头文件
 fn is_excluded(name: &str, patterns: &[String]) -> bool {
     for pat in patterns {
         if pat == ".*" {
             if name.starts_with('.') { return true; }
+        } else if let Some(suffix) = pat.strip_prefix('*') {
+            // *.store, *.tmp
+            if name.ends_with(suffix) { return true; }
         } else if let Some(prefix) = pat.strip_suffix('*') {
+            // ._*
             if name.starts_with(prefix) { return true; }
         } else if pat == name {
             return true;
