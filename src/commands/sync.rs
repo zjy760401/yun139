@@ -118,6 +118,8 @@ struct SyncCtx {
     delete: bool,
     cloud_root: String,
     parallel: usize,
+    /// 排除的文件名模式
+    exclude: Vec<String>,
 
     // JoinSet（TokioMutex 保护，因为多个 scan 协程会并发 push）
     join_set: TokioMutex<tokio::task::JoinSet<()>>,
@@ -181,12 +183,18 @@ async fn streaming_sync(
     .unwrap()
     .progress_chars("━╸─");
 
+    // 从 config 加载 exclude 列表
+    let exclude = crate::config::Config::load()
+        .map(|c| c.exclude)
+        .unwrap_or_else(|_| crate::config::default_exclude());
+
     let ctx = Arc::new(SyncCtx {
         client: client.clone(),
         direction,
         delete: opts.delete,
         cloud_root: ct.clone(),
         parallel: p,
+        exclude,
         join_set: TokioMutex::new(tokio::task::JoinSet::new()),
         transfer_sem: Arc::new(tokio::sync::Semaphore::new(p)),
         scan_sem: Arc::new(tokio::sync::Semaphore::new(p)),
@@ -339,7 +347,8 @@ async fn scan_dir_inner(
 
     // 并行获取本地和云盘列表
     let ld = local_dir.clone();
-    let local_handle = tokio::task::spawn_blocking(move || read_local_dir(&ld));
+    let excl = ctx.exclude.clone();
+    let local_handle = tokio::task::spawn_blocking(move || read_local_dir(&ld, &excl));
 
     let cloud_items = if local_only {
         Vec::new()
@@ -661,7 +670,7 @@ struct LocalEntry {
     size: u64,
 }
 
-fn read_local_dir(dir: &Path) -> Vec<LocalEntry> {
+fn read_local_dir(dir: &Path, exclude: &[String]) -> Vec<LocalEntry> {
     let rd = match std::fs::read_dir(dir) {
         Ok(r) => r,
         Err(_) => return Vec::new(),
@@ -673,10 +682,28 @@ fn read_local_dir(dir: &Path) -> Vec<LocalEntry> {
             Err(_) => continue,
         };
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') { continue; }
+        if name.starts_with('.') && !exclude.is_empty() {
+            // 隐藏文件如果在排除列表中也跳过（默认已排除 .DS_Store 等）
+        }
+        if is_excluded(&name, exclude) { continue; }
         entries.push(LocalEntry { name, is_dir: meta.is_dir(), size: meta.len() });
     }
     entries
+}
+
+/// 检查文件名是否匹配排除模式。
+/// 支持: 精确匹配、`*` 前缀通配（如 `._*`）、`.*` 隐藏文件通配。
+fn is_excluded(name: &str, patterns: &[String]) -> bool {
+    for pat in patterns {
+        if pat == ".*" {
+            if name.starts_with('.') { return true; }
+        } else if let Some(prefix) = pat.strip_suffix('*') {
+            if name.starts_with(prefix) { return true; }
+        } else if pat == name {
+            return true;
+        }
+    }
+    false
 }
 
 fn truncate_name(name: &str, max_len: usize) -> String {

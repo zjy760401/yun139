@@ -129,6 +129,18 @@ enum ConfigAction {
         value: String,
     },
 
+    /// 管理排除列表（上传/同步时跳过的文件名模式）
+    ///
+    /// 示例:
+    ///   config exclude                — 查看当前排除列表
+    ///   config exclude add "*.tmp"    — 添加模式
+    ///   config exclude rm ".DS_Store" — 删除模式
+    ///   config exclude reset          — 恢复默认列表
+    Exclude {
+        /// add <pattern> | rm <pattern> | reset（无参数则显示列表）
+        args: Vec<String>,
+    },
+
     /// 删除配置文件（登出）
     Reset,
 }
@@ -316,6 +328,7 @@ fn do_config(action: &ConfigAction) {
         ConfigAction::Token { value } => config_token(value),
         ConfigAction::Parallel { value } => config_parallel(*value),
         ConfigAction::Log { value } => config_log(value),
+        ConfigAction::Exclude { args } => config_exclude(args),
         ConfigAction::Reset => config_reset(),
     }
 }
@@ -335,6 +348,7 @@ fn config_show() {
                 Some(f) if !f.is_empty() => eprintln!("   日志文件: {f}"),
                 _ => eprintln!("   日志文件: (未设置，输出到终端)"),
             }
+            eprintln!("   排除列表: {} 条 {:?}", config.exclude.len(), config.exclude);
             if let Ok(path) = yun139::config::Config::config_path() {
                 eprintln!("   配置路径: {}", path.display());
             }
@@ -423,6 +437,64 @@ fn to_absolute_path(path: &str) -> String {
         }
     }
     clean.to_string_lossy().to_string()
+}
+
+fn config_exclude(args: &[String]) {
+    if args.is_empty() {
+        // 显示当前列表
+        match yun139::config::Config::load() {
+            Ok(config) => {
+                eprintln!("排除列表 ({} 条):", config.exclude.len());
+                for p in &config.exclude {
+                    eprintln!("  {p}");
+                }
+            }
+            Err(yun139::config::ConfigError::NotFound) => {
+                eprintln!("默认排除列表:");
+                for p in yun139::config::default_exclude() {
+                    eprintln!("  {p}");
+                }
+            }
+            Err(e) => { eprintln!("❌ {e}"); std::process::exit(1); }
+        }
+        return;
+    }
+
+    let cmd = args[0].as_str();
+    match cmd {
+        "add" => {
+            if args.len() < 2 {
+                eprintln!("用法: yun139-cli config exclude add <pattern>");
+                std::process::exit(1);
+            }
+            let pattern = args[1].clone();
+            update_config(|c| {
+                if !c.exclude.contains(&pattern) {
+                    c.exclude.push(pattern.clone());
+                }
+            }, &format!("exclude += {pattern}"));
+        }
+        "rm" | "remove" | "del" => {
+            if args.len() < 2 {
+                eprintln!("用法: yun139-cli config exclude rm <pattern>");
+                std::process::exit(1);
+            }
+            let pattern = &args[1];
+            update_config(|c| {
+                c.exclude.retain(|p| p != pattern);
+            }, &format!("exclude -= {pattern}"));
+        }
+        "reset" => {
+            update_config(|c| {
+                c.exclude = yun139::config::default_exclude();
+            }, "exclude = (恢复默认)");
+        }
+        _ => {
+            eprintln!("未知操作: {cmd}");
+            eprintln!("用法: config exclude [add <p> | rm <p> | reset]");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// 加载现有 config → 修改 → 保存。

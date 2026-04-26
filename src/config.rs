@@ -46,6 +46,9 @@ pub struct Config {
     /// 日志输出到文件路径（设置后 stderr 不输出日志，不干扰进度条）
     #[serde(default)]
     pub log_file: Option<String>,
+    /// 上传/同步时排除的文件名模式列表
+    #[serde(default = "default_exclude")]
+    pub exclude: Vec<String>,
     /// token 过期时间戳（毫秒）
     #[serde(default)]
     pub token_expire_time: Option<i64>,
@@ -60,6 +63,21 @@ fn default_parallel() -> usize {
 
 fn default_log_level() -> String {
     "warn".to_string()
+}
+
+/// macOS 常见无用文件默认排除列表。
+pub fn default_exclude() -> Vec<String> {
+    vec![
+        ".DS_Store".into(),
+        ".Spotlight-V100".into(),
+        ".Trashes".into(),
+        ".fseventsd".into(),
+        ".TemporaryItems".into(),
+        "Thumbs.db".into(),
+        "desktop.ini".into(),
+        "._*".into(),
+        ".AppleDouble".into(),
+    ]
 }
 
 impl Config {
@@ -138,6 +156,7 @@ impl Config {
             parallel: DEFAULT_PARALLEL,
             log_level: default_log_level(),
             log_file: None,
+            exclude: default_exclude(),
             token_expire_time: expire_time,
             personal_cloud_host: None,
         })
