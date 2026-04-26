@@ -121,11 +121,13 @@ impl Yun139Client {
 
 // ── 流式并行同步核心 ──
 
-/// BFS 目录队列条目: (本地目录, 云盘目录, rel_prefix)
+/// BFS 目录队列条目
 struct DirJob {
     local_dir: PathBuf,
     cloud_dir: String,
     prefix: String,
+    /// 本地独有的新目录 — 跳过云盘 list API（云盘侧肯定为空）
+    local_only: bool,
 }
 
 async fn streaming_sync(
@@ -184,6 +186,7 @@ async fn streaming_sync(
         local_dir: local_root.to_path_buf(),
         cloud_dir: ct.clone(),
         prefix: String::new(),
+        local_only: false,
     });
 
     // ── 生产者: BFS 遍历 + spawn 任务 ──
@@ -200,14 +203,17 @@ async fn streaming_sync(
             read_local_dir(&local_dir_owned)
         });
 
-        let cloud_items = client.list_all_quiet(&job.cloud_dir).await;
+        // 本地独有目录跳过云盘 API（云盘侧刚创建，肯定为空）
+        let cloud_items = if job.local_only {
+            Vec::new()
+        } else {
+            client.list_all_quiet(&job.cloud_dir).await.unwrap_or_default()
+        };
 
         let local_entries = match local_entries_handle.await {
             Ok(v) => v,
             Err(_) => Vec::new(),
         };
-
-        let cloud_items = cloud_items.unwrap_or_default();
 
         let local_map: HashMap<&str, &LocalEntry> =
             local_entries.iter().map(|e| (e.name.as_str(), e)).collect();
@@ -219,9 +225,10 @@ async fn streaming_sync(
                 // 本地有的
                 for le in &local_entries {
                     if le.is_dir {
-                        if !cloud_map.contains_key(le.name.as_str()) {
+                        let cloud_path = rel_cloud(&ct, &job.prefix, &le.name);
+                        let is_new = !cloud_map.contains_key(le.name.as_str());
+                        if is_new {
                             // 新目录 → 串行创建
-                            let cloud_path = rel_cloud(&ct, &job.prefix, &le.name);
                             scan_pb.set_message(format!("📁 {cloud_path}"));
                             match client.ensure_dir(&cloud_path).await {
                                 Ok(_) => { dirs_created.fetch_add(1, Ordering::Relaxed); }
@@ -231,11 +238,12 @@ async fn streaming_sync(
                                 }
                             }
                         }
-                        // 子目录加入队列
+                        // 子目录加入队列（本地独有时标记 local_only 以跳过云盘 list）
                         queue.push_back(DirJob {
                             local_dir: job.local_dir.join(&le.name),
-                            cloud_dir: rel_cloud(&ct, &job.prefix, &le.name),
+                            cloud_dir: cloud_path,
                             prefix: rel_path(&job.prefix, &le.name),
+                            local_only: is_new,
                         });
                     } else {
                         // 文件：对比 size
@@ -257,11 +265,17 @@ async fn streaming_sync(
                         }
                     }
                 }
-                // 云盘有、本地无 → 收集删除
+                // 云盘有、本地无 → 收集删除（目录需递归收集子文件）
                 if opts.delete {
                     for ci in &cloud_items {
                         if !local_map.contains_key(ci.name.as_str()) {
                             let cloud = rel_cloud(&ct, &job.prefix, &ci.name);
+                            if ci.is_folder {
+                                // 递归收集云盘子目录中的所有内容
+                                collect_cloud_deletes_recursive(
+                                    client, &cloud, &mut pending_deletes,
+                                ).await;
+                            }
                             pending_deletes.push(SyncAction::DeleteCloud { cloud });
                         }
                     }
@@ -271,7 +285,8 @@ async fn streaming_sync(
                 // 云盘有的
                 for ci in &cloud_items {
                     if ci.is_folder {
-                        if !local_map.contains_key(ci.name.as_str()) {
+                        let is_new = !local_map.contains_key(ci.name.as_str());
+                        if is_new {
                             let local_path = job.local_dir.join(&ci.name);
                             scan_pb.set_message(format!("📁 {}", local_path.display()));
                             match tokio::fs::create_dir_all(&local_path).await {
@@ -286,6 +301,7 @@ async fn streaming_sync(
                             local_dir: job.local_dir.join(&ci.name),
                             cloud_dir: rel_cloud(&ct, &job.prefix, &ci.name),
                             prefix: rel_path(&job.prefix, &ci.name),
+                            local_only: false,
                         });
                     } else {
                         let need_download = match local_map.get(ci.name.as_str()) {
@@ -298,6 +314,7 @@ async fn streaming_sync(
                             let local = job.local_dir.join(&ci.name);
                             spawn_download(
                                 &mut join_set, client, cloud, local, ci.size as u64,
+                                max_parallel,
                                 &uploaded, &downloaded, &failed, &failed_files,
                                 &mp, &overall_pb, &task_style,
                             );
@@ -306,12 +323,14 @@ async fn streaming_sync(
                         }
                     }
                 }
+                // 本地有、云盘无 → 收集删除（目录用 remove_dir_all 即可）
                 if opts.delete {
                     for le in &local_entries {
                         if !cloud_map.contains_key(le.name.as_str()) {
                             pending_deletes.push(SyncAction::DeleteLocal {
                                 local: job.local_dir.join(&le.name),
                             });
+                            // 本地目录无需递归收集，remove_dir_all 会处理
                         }
                     }
                 }
@@ -495,6 +514,7 @@ fn spawn_download(
     cloud_path: String,
     local: PathBuf,
     est_size: u64,
+    parallel: usize,
     uploaded: &Arc<AtomicU32>,
     downloaded: &Arc<AtomicU32>,
     failed: &Arc<AtomicU32>,
@@ -539,7 +559,7 @@ fn spawn_download(
         pb.set_prefix(format!("↓ {}", truncate_name(name, 28)));
 
         let pb2 = pb.clone();
-        let result = client.download_parallel(&url, &local, 4, move |bytes, _| {
+        let result = client.download_parallel(&url, &local, parallel, move |bytes, _| {
             pb2.set_position(bytes);
         }).await;
 
@@ -560,6 +580,31 @@ fn spawn_download(
             "↑{} ↓{}", uploaded.load(Ordering::Relaxed), downloaded.load(Ordering::Relaxed),
         ));
     });
+}
+
+// ── 递归收集云盘删除条目 ──
+
+/// 递归扫描云盘目录，将所有子文件和子目录收集为 DeleteCloud 动作。
+/// 子文件先于子目录（保证删除顺序：文件先删，目录后删）。
+async fn collect_cloud_deletes_recursive(
+    client: &Yun139Client,
+    cloud_dir: &str,
+    pending: &mut Vec<SyncAction>,
+) {
+    let items = match client.list_all_quiet(cloud_dir).await {
+        Ok(items) => items,
+        Err(_) => return,
+    };
+
+    for item in &items {
+        let child_path = format!("{}/{}", cloud_dir.trim_end_matches('/'), item.name);
+        if item.is_folder {
+            // 先递归子目录
+            Box::pin(collect_cloud_deletes_recursive(client, &child_path, pending)).await;
+        }
+        // 文件先，目录后（pending 排序会最终保证顺序）
+        pending.push(SyncAction::DeleteCloud { cloud: child_path });
+    }
 }
 
 // ── 工具函数 ──
