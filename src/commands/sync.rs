@@ -352,46 +352,70 @@ async fn scan_dir_inner(
 
     match ctx.direction {
         SyncDirection::LocalToCloud => {
-            // 子目录：递归 spawn（无限扩散）
-            let mut sub_handles = Vec::new();
+            // ── Phase A: 对比，收集结果 ──
+            struct DirInfo { name: String, cloud_path: String, is_new: bool }
+            struct FileInfo { local: PathBuf, cloud_dir: String }
+
+            let mut new_dirs: Vec<DirInfo> = Vec::new();
+            let mut to_upload: Vec<FileInfo> = Vec::new();
+            let mut skip_count: u32 = 0;
+
             for le in local_entries.iter().filter(|e| e.is_dir) {
                 let cloud_path = rel_cloud(ct, &prefix, &le.name);
                 let is_new = !cloud_map.contains_key(le.name.as_str());
-                if is_new {
-                    ctx.scan_pb.set_message(format!("📁 {cloud_path}"));
-                    match ctx.client.ensure_dir(&cloud_path).await {
-                        Ok(_) => { ctx.dirs_created.fetch_add(1, Ordering::Relaxed); }
-                        Err(e) => {
-                            tracing::error!(err = %e, dir = %cloud_path, "mkdir cloud failed");
-                            ctx.failed.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                }
-                let ctx2 = ctx.clone();
-                let sub_local = local_dir.join(&le.name);
-                let sub_prefix = rel_path(&prefix, &le.name);
-                sub_handles.push(tokio::spawn(async move {
-                    scan_dir(ctx2, sub_local, cloud_path, sub_prefix, is_new).await;
-                }));
+                new_dirs.push(DirInfo { name: le.name.clone(), cloud_path, is_new });
             }
 
-            // 文件：对比 size → spawn 上传
             for le in local_entries.iter().filter(|e| !e.is_dir) {
                 let need = match cloud_map.get(le.name.as_str()) {
                     None => true,
                     Some(ci) => ci.size != le.size as i64,
                 };
                 if need {
-                    ctx.overall_pb.inc_length(1);
-                    let local = local_dir.join(&le.name);
-                    let cloud = cloud_dir.clone();
-                    push_upload(&ctx, local, cloud).await;
+                    to_upload.push(FileInfo {
+                        local: local_dir.join(&le.name),
+                        cloud_dir: cloud_dir.clone(),
+                    });
                 } else {
-                    ctx.skipped.fetch_add(1, Ordering::Relaxed);
+                    skip_count += 1;
                 }
             }
 
-            // 删除收集
+            // ── Phase B: 更新进度条 ──
+            if !to_upload.is_empty() {
+                ctx.overall_pb.inc_length(to_upload.len() as u64);
+            }
+            ctx.skipped.fetch_add(skip_count, Ordering::Relaxed);
+
+            // ── Phase C: 创建目录 + spawn 子目录 scan ──
+            let mut sub_handles = Vec::new();
+            for d in &new_dirs {
+                if d.is_new {
+                    ctx.scan_pb.set_message(format!("📁 {}", d.cloud_path));
+                    match ctx.client.ensure_dir(&d.cloud_path).await {
+                        Ok(_) => { ctx.dirs_created.fetch_add(1, Ordering::Relaxed); }
+                        Err(e) => {
+                            tracing::error!(err = %e, dir = %d.cloud_path, "mkdir cloud failed");
+                            ctx.failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                let ctx2 = ctx.clone();
+                let sub_local = local_dir.join(&d.name);
+                let cp = d.cloud_path.clone();
+                let sp = rel_path(&prefix, &d.name);
+                let lo = d.is_new;
+                sub_handles.push(tokio::spawn(async move {
+                    scan_dir(ctx2, sub_local, cp, sp, lo).await;
+                }));
+            }
+
+            // ── Phase D: 排队提交传输到 JoinSet ──
+            for f in to_upload {
+                push_upload(&ctx, f.local, f.cloud_dir).await;
+            }
+
+            // ── Phase E: 收集删除 ──
             if ctx.delete {
                 for ci in &cloud_items {
                     if !local_map.contains_key(ci.name.as_str()) {
@@ -404,17 +428,52 @@ async fn scan_dir_inner(
                 }
             }
 
-            // 等待子目录 scan 完成
+            // ── Phase F: 等待子目录 scan 完成 ──
             for h in sub_handles {
                 let _ = h.await;
             }
         }
         SyncDirection::CloudToLocal => {
-            let mut sub_handles = Vec::new();
+            // ── Phase A: 对比，收集结果 ──
+            struct DirInfo { name: String, is_new: bool }
+            struct FileInfo { cloud: String, local: PathBuf, size: u64 }
+
+            let mut new_dirs: Vec<DirInfo> = Vec::new();
+            let mut to_download: Vec<FileInfo> = Vec::new();
+            let mut skip_count: u32 = 0;
+
             for ci in cloud_items.iter().filter(|e| e.is_folder) {
                 let is_new = !local_map.contains_key(ci.name.as_str());
-                if is_new {
-                    let lp = local_dir.join(&ci.name);
+                new_dirs.push(DirInfo { name: ci.name.clone(), is_new });
+            }
+
+            for ci in cloud_items.iter().filter(|e| !e.is_folder) {
+                let need = match local_map.get(ci.name.as_str()) {
+                    None => true,
+                    Some(le) => le.size as i64 != ci.size,
+                };
+                if need {
+                    to_download.push(FileInfo {
+                        cloud: rel_cloud(ct, &prefix, &ci.name),
+                        local: local_dir.join(&ci.name),
+                        size: ci.size as u64,
+                    });
+                } else {
+                    skip_count += 1;
+                }
+            }
+
+            // ── Phase B: 更新进度条 ──
+            if !to_download.is_empty() {
+                ctx.overall_pb.inc_length(to_download.len() as u64);
+            }
+            ctx.skipped.fetch_add(skip_count, Ordering::Relaxed);
+
+            // ── Phase C: 创建目录 + spawn 子目录 scan ──
+            let mut sub_handles = Vec::new();
+            for d in &new_dirs {
+                if d.is_new {
+                    let lp = local_dir.join(&d.name);
                     ctx.scan_pb.set_message(format!("📁 {}", lp.display()));
                     match tokio::fs::create_dir_all(&lp).await {
                         Ok(_) => { ctx.dirs_created.fetch_add(1, Ordering::Relaxed); }
@@ -425,29 +484,20 @@ async fn scan_dir_inner(
                     }
                 }
                 let ctx2 = ctx.clone();
-                let sub_local = local_dir.join(&ci.name);
-                let sub_cloud = rel_cloud(ct, &prefix, &ci.name);
-                let sub_prefix = rel_path(&prefix, &ci.name);
+                let sub_local = local_dir.join(&d.name);
+                let sub_cloud = rel_cloud(ct, &prefix, &d.name);
+                let sp = rel_path(&prefix, &d.name);
                 sub_handles.push(tokio::spawn(async move {
-                    scan_dir(ctx2, sub_local, sub_cloud, sub_prefix, false).await;
+                    scan_dir(ctx2, sub_local, sub_cloud, sp, false).await;
                 }));
             }
 
-            for ci in cloud_items.iter().filter(|e| !e.is_folder) {
-                let need = match local_map.get(ci.name.as_str()) {
-                    None => true,
-                    Some(le) => le.size as i64 != ci.size,
-                };
-                if need {
-                    ctx.overall_pb.inc_length(1);
-                    let cloud = rel_cloud(ct, &prefix, &ci.name);
-                    let local = local_dir.join(&ci.name);
-                    push_download(&ctx, cloud, local, ci.size as u64).await;
-                } else {
-                    ctx.skipped.fetch_add(1, Ordering::Relaxed);
-                }
+            // ── Phase D: 排队提交传输到 JoinSet ──
+            for f in to_download {
+                push_download(&ctx, f.cloud, f.local, f.size).await;
             }
 
+            // ── Phase E: 收集删除 ──
             if ctx.delete {
                 for le in &local_entries {
                     if !cloud_map.contains_key(le.name.as_str()) {
@@ -458,6 +508,7 @@ async fn scan_dir_inner(
                 }
             }
 
+            // ── Phase F: 等待子目录 scan 完成 ──
             for h in sub_handles {
                 let _ = h.await;
             }
