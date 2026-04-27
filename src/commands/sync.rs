@@ -10,7 +10,9 @@
 //!
 //!   global_sem(P): 总并行度上限，所有 scan + transfer 共享
 //!   scan_sem(2):   扫描子限额，防止 scan 独占全部 permit
-//!   transfer_sem(P): 传输子限额，受 global_sem 约束
+//!
+//!   scan 先占 scan_sem 再占 global_sem，transfer 只占 global_sem。
+//!   当 transfer 密集时 global permit 被消费者占满，scan 自然背压等待。
 //! ```
 
 use std::collections::HashMap;
@@ -132,8 +134,6 @@ struct SyncCtx {
     join_set: TokioMutex<tokio::task::JoinSet<()>>,
     // 全局信号量（控制 scan + transfer 总并行度）
     global_sem: Arc<tokio::sync::Semaphore>,
-    // 传输信号量（控制同时执行的上传/下载数）
-    transfer_sem: Arc<tokio::sync::Semaphore>,
     // 扫描信号量（控制同时扫描的目录数）
     scan_sem: Arc<tokio::sync::Semaphore>,
 
@@ -208,7 +208,6 @@ async fn streaming_sync(
         exclude,
         join_set: TokioMutex::new(tokio::task::JoinSet::new()),
         global_sem: Arc::new(tokio::sync::Semaphore::new(p)),
-        transfer_sem: Arc::new(tokio::sync::Semaphore::new(p)),
         scan_sem: Arc::new(tokio::sync::Semaphore::new(2)),
         pending_deletes: TokioMutex::new(Vec::new()),
         uploaded: Arc::new(AtomicU32::new(0)),
@@ -348,9 +347,11 @@ async fn scan_dir_inner(
     prefix: String,
     local_only: bool,
 ) {
-    // 先获取全局 permit，再获取扫描 permit
-    let _global_permit = ctx.global_sem.acquire().await.unwrap();
+    // 先获取扫描 permit，再获取全局 permit
+    // scan 是生产者，transfer 是消费者；让 scan 在 global_sem 上排队，
+    // 使 transfer 优先消费，实现背压控制。
     let _scan_permit = ctx.scan_sem.acquire().await.unwrap();
+    let _global_permit = ctx.global_sem.acquire().await.unwrap();
 
     ctx.scan_pb.set_message(if prefix.is_empty() {
         "/".to_string()
@@ -625,31 +626,27 @@ async fn scan_dir_inner(
     }
 }
 
-// ── JoinSet push（全局 + 分类信号量双重控制） ──
+// ── JoinSet push（global_sem 控制并发） ──
 
-/// 推入上传任务到 JoinSet。并发由 global_sem + transfer_sem 控制。
+/// 推入上传任务到 JoinSet。并发由 global_sem 控制。
 async fn push_upload(ctx: &Arc<SyncCtx>, local: PathBuf, cloud_dir: String) {
     let ctx2 = ctx.clone();
     let global = ctx.global_sem.clone();
-    let sem = ctx.transfer_sem.clone();
     let mut js = ctx.join_set.lock().await;
     js.spawn(async move {
         let _global_permit = global.acquire().await.unwrap();
-        let _permit = sem.acquire().await.unwrap();
         do_upload_task(&ctx2, local, cloud_dir).await;
     });
 }
 
-/// 推入下载任务到 JoinSet。并发由 global_sem + transfer_sem 控制。
+/// 推入下载任务到 JoinSet。并发由 global_sem 控制。
 async fn push_download(ctx: &Arc<SyncCtx>, cloud: String, local: PathBuf, est_size: u64) {
     let ctx2 = ctx.clone();
     let global = ctx.global_sem.clone();
-    let sem = ctx.transfer_sem.clone();
     let parallel = ctx.parallel;
     let mut js = ctx.join_set.lock().await;
     js.spawn(async move {
         let _global_permit = global.acquire().await.unwrap();
-        let _permit = sem.acquire().await.unwrap();
         do_download_task(&ctx2, cloud, local, est_size, parallel).await;
     });
 }
