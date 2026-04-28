@@ -24,7 +24,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use tokio::sync::Mutex as TokioMutex;
 
 use crate::commands::list::ListItem;
-use crate::config::DEFAULT_PARALLEL;
+use crate::config::default_parallel;
 use crate::error::{Result, Yun139Error};
 use crate::Yun139Client;
 
@@ -48,7 +48,7 @@ pub struct SyncOptions {
 
 impl Default for SyncOptions {
     fn default() -> Self {
-        Self { delete: false, concurrency: DEFAULT_PARALLEL, upload_only: false, download_only: false }
+        Self { delete: false, concurrency: default_parallel(), upload_only: false, download_only: false }
     }
 }
 

@@ -295,7 +295,7 @@ fn resolve_log_file_path(raw: &str) -> String {
 
 /// 从 $YUN139_AUTH 或配置文件读取 auth + parallel。
 fn resolve_auth_and_parallel() -> (String, usize) {
-    let default_p = yun139::config::DEFAULT_PARALLEL;
+    let default_p = yun139::config::default_parallel();
 
     // 环境变量优先
     if let Ok(env_auth) = std::env::var("YUN139_AUTH") {

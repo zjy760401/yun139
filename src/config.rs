@@ -27,8 +27,12 @@ pub enum ConfigError {
     InvalidToken(String),
 }
 
-/// 默认并行数。
-pub const DEFAULT_PARALLEL: usize = 16;
+/// 默认并行数（等于 CPU 核心数）。
+pub fn default_parallel() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(16)
+}
 
 /// 持久化配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,10 +59,6 @@ pub struct Config {
     /// 缓存的个人云主机地址（可选，加速首次请求）
     #[serde(default)]
     pub personal_cloud_host: Option<String>,
-}
-
-fn default_parallel() -> usize {
-    DEFAULT_PARALLEL
 }
 
 fn default_log_level() -> String {
@@ -153,7 +153,7 @@ impl Config {
         Ok(Config {
             authorization: b64,
             account,
-            parallel: DEFAULT_PARALLEL,
+            parallel: default_parallel(),
             log_level: default_log_level(),
             log_file: None,
             exclude: default_exclude(),
