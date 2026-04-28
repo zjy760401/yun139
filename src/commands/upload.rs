@@ -93,7 +93,7 @@ impl Yun139Client {
             "parentFileId": parent_file_id,
             "name": file_name,
             "type": "file",
-            "fileRenameMode": "overwrite"
+            "fileRenameMode": "force_rename"
         });
 
         tracing::info!("creating upload task");

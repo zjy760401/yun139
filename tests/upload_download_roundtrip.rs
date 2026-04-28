@@ -3,20 +3,30 @@
 //! 每次运行生成全新随机内容，避免秒传命中，确保真实上传链路被测试。
 //! 测试直接调用编译好的 `yun139` 二进制，验证端到端 CLI 工作流。
 //!
-//! 需要设置环境变量 `YUN139_AUTH` 才能运行。
+//! 认证方式（按优先级）：
+//!   1. 环境变量 `YUN139_AUTH`
+//!   2. 系统配置文件 `~/.config/yun139/config.toml`（通过 `yun139 config token` 设置）
 //!
 //! 运行方式:
-//!   YUN139_AUTH="Basic cGM6MTM5..." cargo test --test upload_download_roundtrip -- --nocapture
+//!   cargo test --test upload_download_roundtrip -- --nocapture
 
 use std::io::Write;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use yun139::config::Config;
+
 const FILE_SIZE: usize = 200 * 1024 * 1024; // 200MB
 const CLOUD_DIR: &str = "/yun139_test_roundtrip";
 
+/// 获取认证信息：优先环境变量，回退到系统配置文件。
 fn get_auth() -> Option<String> {
-    std::env::var("YUN139_AUTH").ok().filter(|s| !s.is_empty())
+    if let Ok(env) = std::env::var("YUN139_AUTH") {
+        if !env.is_empty() {
+            return Some(env);
+        }
+    }
+    Config::load().ok().map(|c| c.authorization_header())
 }
 
 /// 获取 CLI 二进制路径（cargo test 编译产物同目录）
@@ -87,10 +97,11 @@ fn upload_download_roundtrip_via_cli() {
     let auth = match get_auth() {
         Some(a) => a,
         None => {
-            eprintln!("⏭️  跳过: 未设置 YUN139_AUTH 环境变量");
+            eprintln!("⏭️  跳过: 未设置 YUN139_AUTH 且未找到系统配置 (~/.config/yun139/config.toml)");
             return;
         }
     };
+    eprintln!("🔑 认证来源: {}", if std::env::var("YUN139_AUTH").is_ok() { "环境变量" } else { "系统配置" });
 
     let bin = cli_bin();
     assert!(bin.exists(), "CLI 未编译: {:?}，请先 cargo build", bin);
