@@ -350,8 +350,21 @@ async fn scan_dir_inner(
     // 先获取扫描 permit，再获取全局 permit
     // scan 是生产者，transfer 是消费者；让 scan 在 global_sem 上排队，
     // 使 transfer 优先消费，实现背压控制。
+    let scan_wait_start = std::time::Instant::now();
     let _scan_permit = ctx.scan_sem.acquire().await.unwrap();
+    let scan_wait = scan_wait_start.elapsed();
+
+    let global_wait_start = std::time::Instant::now();
     let _global_permit = ctx.global_sem.acquire().await.unwrap();
+    let global_wait = global_wait_start.elapsed();
+
+    if scan_wait.as_millis() > 100 || global_wait.as_millis() > 100 {
+        tracing::info!(
+            dir = %prefix, scan_wait_ms = scan_wait.as_millis() as u64,
+            global_wait_ms = global_wait.as_millis() as u64,
+            "scan permit wait"
+        );
+    }
 
     ctx.scan_pb.set_message(if prefix.is_empty() {
         "/".to_string()
@@ -360,6 +373,7 @@ async fn scan_dir_inner(
     });
 
     // 并行获取本地和云盘列表
+    let list_start = std::time::Instant::now();
     let ld = local_dir.clone();
     let excl = ctx.exclude.clone();
     let local_handle = tokio::task::spawn_blocking(move || read_local_dir(&ld, &excl));
@@ -371,6 +385,13 @@ async fn scan_dir_inner(
     };
 
     let local_entries = local_handle.await.unwrap_or_default();
+    let list_elapsed = list_start.elapsed();
+
+    tracing::info!(
+        dir = %prefix, local_count = local_entries.len(), cloud_count = cloud_items.len(),
+        list_ms = list_elapsed.as_millis() as u64,
+        "scan_dir listed"
+    );
 
     let local_map: HashMap<&str, &LocalEntry> =
         local_entries.iter().map(|e| (e.name.as_str(), e)).collect();
@@ -435,6 +456,11 @@ async fn scan_dir_inner(
             }
 
             // ── Phase B: 更新进度条（download_only 时跳过上传） ──
+            tracing::info!(
+                dir = %prefix, to_upload = to_upload.len(), to_hash = to_hash_check.len(),
+                skipped = skip_count, sub_dirs = new_dirs.len(),
+                "scan_dir decision"
+            );
             if ctx.download_only {
                 ctx.skipped.fetch_add(to_upload.len() as u32, Ordering::Relaxed);
                 to_upload.clear();
@@ -453,19 +479,33 @@ async fn scan_dir_inner(
                 ctx.skipped.fetch_add(to_hash_check.len() as u32, Ordering::Relaxed);
             }
 
-            // ── Phase C: 创建目录 + spawn 子目录 scan ──
-            let mut sub_handles = Vec::new();
-            for d in &new_dirs {
-                if d.is_new {
-                    ctx.scan_pb.set_message(format!("📁 {}", d.cloud_path));
-                    match ctx.client.ensure_dir(&d.cloud_path).await {
+            // ── Phase C: 并行创建目录 + spawn 子目录 scan ──
+            // 先并行创建所有新目录
+            let new_dir_paths: Vec<&DirInfo> = new_dirs.iter().filter(|d| d.is_new).collect();
+            if !new_dir_paths.is_empty() {
+                ctx.scan_pb.set_message(format!("📁 creating {} dirs", new_dir_paths.len()));
+                let mkdir_futures: Vec<_> = new_dir_paths.iter().map(|d| {
+                    let client = ctx.client.clone();
+                    let path = d.cloud_path.clone();
+                    async move {
+                        (client.ensure_dir(&path).await, path)
+                    }
+                }).collect();
+                let results = futures_util::future::join_all(mkdir_futures).await;
+                for (result, path) in results {
+                    match result {
                         Ok(_) => { ctx.dirs_created.fetch_add(1, Ordering::Relaxed); }
                         Err(e) => {
-                            tracing::error!(err = %e, dir = %d.cloud_path, "mkdir cloud failed");
+                            tracing::error!(err = %e, dir = %path, "mkdir cloud failed");
                             ctx.failed.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
+            }
+
+            // 再 spawn 子目录 scan
+            let mut sub_handles = Vec::new();
+            for d in &new_dirs {
                 let ctx2 = ctx.clone();
                 let sub_local = local_dir.join(&d.name);
                 let cp = d.cloud_path.clone();
@@ -652,15 +692,25 @@ async fn push_hash_then_upload(ctx: &Arc<SyncCtx>, local: PathBuf, cloud_dir: St
     let global = ctx.global_sem.clone();
     let mut js = ctx.join_set.lock().await;
     js.spawn(async move {
+        let wait_start = std::time::Instant::now();
         let _global_permit = global.acquire().await.unwrap();
+        let wait_elapsed = wait_start.elapsed();
+
+        let hash_start = std::time::Instant::now();
         let path = local.clone();
         let local_hash = tokio::task::spawn_blocking(move || compute_sha256_hex(&path))
             .await.unwrap_or_default();
+        let hash_elapsed = hash_start.elapsed();
+
+        let name = local.file_name().unwrap_or_default().to_string_lossy().to_string();
         if local_hash != cloud_hash {
-            tracing::debug!(file = %local.display(), "hash mismatch → upload");
+            tracing::debug!(file = %name, wait_ms = wait_elapsed.as_millis() as u64,
+                hash_ms = hash_elapsed.as_millis() as u64, "hash mismatch → upload");
             ctx2.overall_pb.inc_length(1);
             do_upload_task(&ctx2, local, cloud_dir).await;
         } else {
+            tracing::info!(file = %name, wait_ms = wait_elapsed.as_millis() as u64,
+                hash_ms = hash_elapsed.as_millis() as u64, "hash match → skip");
             ctx2.skipped.fetch_add(1, Ordering::Relaxed);
         }
     });
@@ -673,15 +723,25 @@ async fn push_hash_then_download(ctx: &Arc<SyncCtx>, cloud: String, local: PathB
     let global = ctx.global_sem.clone();
     let mut js = ctx.join_set.lock().await;
     js.spawn(async move {
+        let wait_start = std::time::Instant::now();
         let _global_permit = global.acquire().await.unwrap();
+        let wait_elapsed = wait_start.elapsed();
+
+        let hash_start = std::time::Instant::now();
         let path = local.clone();
         let local_hash = tokio::task::spawn_blocking(move || compute_sha256_hex(&path))
             .await.unwrap_or_default();
+        let hash_elapsed = hash_start.elapsed();
+
+        let name = local.file_name().unwrap_or_default().to_string_lossy().to_string();
         if local_hash != cloud_hash {
-            tracing::debug!(file = %local.display(), "hash mismatch → download");
+            tracing::debug!(file = %name, wait_ms = wait_elapsed.as_millis() as u64,
+                hash_ms = hash_elapsed.as_millis() as u64, "hash mismatch → download");
             ctx2.overall_pb.inc_length(1);
             do_download_task(&ctx2, cloud, local, est_size, parallel).await;
         } else {
+            tracing::info!(file = %name, wait_ms = wait_elapsed.as_millis() as u64,
+                hash_ms = hash_elapsed.as_millis() as u64, "hash match → skip");
             ctx2.skipped.fetch_add(1, Ordering::Relaxed);
         }
     });
