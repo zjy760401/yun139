@@ -434,19 +434,6 @@ async fn scan_dir_inner(
                 }
             }
 
-            // 并行计算本地 SHA256，与云盘 hash 对比
-            for hc in to_hash_check {
-                let path = hc.local.clone();
-                let local_hash = tokio::task::spawn_blocking(move || compute_sha256_hex(&path))
-                    .await.unwrap_or_default();
-                if local_hash != hc.cloud_hash {
-                    tracing::debug!(file = %hc.local.display(), "hash mismatch → upload");
-                    to_upload.push(FileInfo { local: hc.local, cloud_dir: hc.cloud_dir });
-                } else {
-                    skip_count += 1;
-                }
-            }
-
             // ── Phase B: 更新进度条（download_only 时跳过上传） ──
             if ctx.download_only {
                 ctx.skipped.fetch_add(to_upload.len() as u32, Ordering::Relaxed);
@@ -456,6 +443,15 @@ async fn scan_dir_inner(
                 ctx.overall_pb.inc_length(to_upload.len() as u64);
             }
             ctx.skipped.fetch_add(skip_count, Ordering::Relaxed);
+
+            // hash 检查 → spawn 到 JoinSet 独立协程（利用 global_sem 并行）
+            if !ctx.download_only {
+                for hc in to_hash_check {
+                    push_hash_then_upload(&ctx, hc.local, hc.cloud_dir, hc.cloud_hash).await;
+                }
+            } else {
+                ctx.skipped.fetch_add(to_hash_check.len() as u32, Ordering::Relaxed);
+            }
 
             // ── Phase C: 创建目录 + spawn 子目录 scan ──
             let mut sub_handles = Vec::new();
@@ -557,18 +553,6 @@ async fn scan_dir_inner(
                 }
             }
 
-            for hc in to_hash_check {
-                let path = hc.local.clone();
-                let local_hash = tokio::task::spawn_blocking(move || compute_sha256_hex(&path))
-                    .await.unwrap_or_default();
-                if local_hash != hc.cloud_hash {
-                    tracing::debug!(file = %hc.local.display(), "hash mismatch → download");
-                    to_download.push(FileInfo { cloud: hc.cloud, local: hc.local, size: hc.size });
-                } else {
-                    skip_count += 1;
-                }
-            }
-
             // ── Phase B: 更新进度条（upload_only 时跳过下载） ──
             if ctx.upload_only {
                 ctx.skipped.fetch_add(to_download.len() as u32, Ordering::Relaxed);
@@ -578,6 +562,16 @@ async fn scan_dir_inner(
                 ctx.overall_pb.inc_length(to_download.len() as u64);
             }
             ctx.skipped.fetch_add(skip_count, Ordering::Relaxed);
+
+            // hash 检查 → spawn 到 JoinSet 独立协程（利用 global_sem 并行）
+            if !ctx.upload_only {
+                let parallel = ctx.parallel;
+                for hc in to_hash_check {
+                    push_hash_then_download(&ctx, hc.cloud, hc.local, hc.size, hc.cloud_hash, parallel).await;
+                }
+            } else {
+                ctx.skipped.fetch_add(to_hash_check.len() as u32, Ordering::Relaxed);
+            }
 
             // ── Phase C: 创建目录 + spawn 子目录 scan ──
             let mut sub_handles = Vec::new();
@@ -648,6 +642,48 @@ async fn push_download(ctx: &Arc<SyncCtx>, cloud: String, local: PathBuf, est_si
     js.spawn(async move {
         let _global_permit = global.acquire().await.unwrap();
         do_download_task(&ctx2, cloud, local, est_size, parallel).await;
+    });
+}
+
+/// 推入 hash 校验 + 上传任务到 JoinSet。
+/// 先计算本地 SHA256，与云盘 hash 对比；不匹配则上传，匹配则跳过。
+async fn push_hash_then_upload(ctx: &Arc<SyncCtx>, local: PathBuf, cloud_dir: String, cloud_hash: String) {
+    let ctx2 = ctx.clone();
+    let global = ctx.global_sem.clone();
+    let mut js = ctx.join_set.lock().await;
+    js.spawn(async move {
+        let _global_permit = global.acquire().await.unwrap();
+        let path = local.clone();
+        let local_hash = tokio::task::spawn_blocking(move || compute_sha256_hex(&path))
+            .await.unwrap_or_default();
+        if local_hash != cloud_hash {
+            tracing::debug!(file = %local.display(), "hash mismatch → upload");
+            ctx2.overall_pb.inc_length(1);
+            do_upload_task(&ctx2, local, cloud_dir).await;
+        } else {
+            ctx2.skipped.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+}
+
+/// 推入 hash 校验 + 下载任务到 JoinSet。
+/// 先计算本地 SHA256，与云盘 hash 对比；不匹配则下载，匹配则跳过。
+async fn push_hash_then_download(ctx: &Arc<SyncCtx>, cloud: String, local: PathBuf, est_size: u64, cloud_hash: String, parallel: usize) {
+    let ctx2 = ctx.clone();
+    let global = ctx.global_sem.clone();
+    let mut js = ctx.join_set.lock().await;
+    js.spawn(async move {
+        let _global_permit = global.acquire().await.unwrap();
+        let path = local.clone();
+        let local_hash = tokio::task::spawn_blocking(move || compute_sha256_hex(&path))
+            .await.unwrap_or_default();
+        if local_hash != cloud_hash {
+            tracing::debug!(file = %local.display(), "hash mismatch → download");
+            ctx2.overall_pb.inc_length(1);
+            do_download_task(&ctx2, cloud, local, est_size, parallel).await;
+        } else {
+            ctx2.skipped.fetch_add(1, Ordering::Relaxed);
+        }
     });
 }
 
