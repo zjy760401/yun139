@@ -1,21 +1,22 @@
-//! 同步命令 — 本地目录与云盘目录流式并行同步。
+//! 同步命令 — 本地目录与云盘目录流水线并行同步。
 //!
-//! **并行模型**:
+//! **流水线模型**:
 //!
 //! ```text
-//!   scan (递归 spawn)
-//!     ├─ 子目录 → tokio::spawn(scan_dir)
-//!     ├─ 文件上传/下载 → JoinSet.spawn()
-//!     └─ 删除 → pending_deletes
+//!   Stage 1: Walker（单协程，BFS 广度优先）
+//!     - 遍历本地目录树，每层: read_local + list_cloud
+//!     - 对比后将任务分发到 Stage 2
 //!
-//!   global_sem(P): 总并行度上限，所有 scan + transfer 共享
-//!   scan_sem(2):   扫描子限额，防止 scan 独占全部 permit
+//!   Stage 2: Workers（多协程，JoinSet）
+//!     - mkdir: 并行创建云盘目录
+//!     - hash+upload/download: 先 SHA256 对比再传输
+//!     - 直接 upload/download: 无需对比，直接传输
 //!
-//!   scan 先占 scan_sem 再占 global_sem，transfer 只占 global_sem。
-//!   当 transfer 密集时 global permit 被消费者占满，scan 自然背压等待。
+//!   global_sem(P): 唯一并发控制，Walker 调 list API 时短暂持有，
+//!                  Workers 在执行任务时持有。
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -118,7 +119,6 @@ impl Yun139Client {
 
 // ── 共享上下文 ──
 
-/// 在所有 scan/transfer 协程间共享的状态。
 struct SyncCtx {
     client: Yun139Client,
     direction: SyncDirection,
@@ -127,17 +127,14 @@ struct SyncCtx {
     download_only: bool,
     cloud_root: String,
     parallel: usize,
-    /// 排除的文件名模式
     exclude: Vec<String>,
 
-    // JoinSet（TokioMutex 保护，因为多个 scan 协程会并发 push）
+    // Worker JoinSet
     join_set: TokioMutex<tokio::task::JoinSet<()>>,
-    // 全局信号量（控制 scan + transfer 总并行度）
+    // 唯一的并发控制信号量
     global_sem: Arc<tokio::sync::Semaphore>,
-    // 扫描信号量（控制同时扫描的目录数）
-    scan_sem: Arc<tokio::sync::Semaphore>,
 
-    // 延迟删除（scan 完毕后串行执行）
+    // 延迟删除
     pending_deletes: TokioMutex<Vec<SyncAction>>,
 
     // 计数器
@@ -192,7 +189,6 @@ async fn streaming_sync(
     .unwrap()
     .progress_chars("━╸─");
 
-    // 从 config 加载 exclude 列表
     let exclude = crate::config::Config::load()
         .map(|c| c.exclude)
         .unwrap_or_else(|_| crate::config::default_exclude());
@@ -208,7 +204,6 @@ async fn streaming_sync(
         exclude,
         join_set: TokioMutex::new(tokio::task::JoinSet::new()),
         global_sem: Arc::new(tokio::sync::Semaphore::new(p)),
-        scan_sem: Arc::new(tokio::sync::Semaphore::new(2)),
         pending_deletes: TokioMutex::new(Vec::new()),
         uploaded: Arc::new(AtomicU32::new(0)),
         downloaded: Arc::new(AtomicU32::new(0)),
@@ -222,14 +217,8 @@ async fn streaming_sync(
         task_style,
     });
 
-    // ── 递归扫描（global_sem + scan_sem 双重控制） ──
-    scan_dir(
-        ctx.clone(),
-        local_root.to_path_buf(),
-        ct.clone(),
-        String::new(),
-        false,
-    ).await;
+    // ── Stage 1: Walker（BFS 广度优先遍历） ──
+    bfs_walk(ctx.clone(), local_root.to_path_buf(), ct.clone()).await;
 
     // ── 扫描完毕 ──
     scan_pb.set_style(ProgressStyle::with_template("  {prefix} {msg}").unwrap());
@@ -242,7 +231,7 @@ async fn streaming_sync(
         pending_len,
     ));
 
-    // ── drain JoinSet 中剩余传输任务 ──
+    // ── drain JoinSet 中剩余 Worker 任务 ──
     {
         let mut js = ctx.join_set.lock().await;
         while js.join_next().await.is_some() {}
@@ -327,421 +316,418 @@ fn delete_sort_key(a: &SyncAction) -> (bool, &str) {
     }
 }
 
-// ── 递归扫描（global_sem + scan_sem 双重控制） ──
+// ── Stage 1: BFS Walker ──
 
-/// 扫描单个目录：对比本地 vs 云盘，子目录递归 spawn，文件差异推入 JoinSet。
-fn scan_dir(
-    ctx: Arc<SyncCtx>,
+/// BFS 待扫描目录项
+struct WalkItem {
     local_dir: PathBuf,
     cloud_dir: String,
     prefix: String,
+    /// 父目录是新目录 → 跳过云端 list，所有文件直接上传/下载
     local_only: bool,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-    Box::pin(scan_dir_inner(ctx, local_dir, cloud_dir, prefix, local_only))
 }
 
-async fn scan_dir_inner(
-    ctx: Arc<SyncCtx>,
-    local_dir: PathBuf,
-    cloud_dir: String,
-    prefix: String,
-    local_only: bool,
-) {
-    // 先获取扫描 permit，再获取全局 permit
-    // scan 是生产者，transfer 是消费者；让 scan 在 global_sem 上排队，
-    // 使 transfer 优先消费，实现背压控制。
-    let scan_wait_start = std::time::Instant::now();
-    let _scan_permit = ctx.scan_sem.acquire().await.unwrap();
-    let scan_wait = scan_wait_start.elapsed();
-
-    let global_wait_start = std::time::Instant::now();
-    let _global_permit = ctx.global_sem.acquire().await.unwrap();
-    let global_wait = global_wait_start.elapsed();
-
-    if scan_wait.as_millis() > 100 || global_wait.as_millis() > 100 {
-        tracing::info!(
-            dir = %prefix, scan_wait_ms = scan_wait.as_millis() as u64,
-            global_wait_ms = global_wait.as_millis() as u64,
-            "scan permit wait"
-        );
-    }
-
-    ctx.scan_pb.set_message(if prefix.is_empty() {
-        "/".to_string()
-    } else {
-        truncate_name(&prefix, 50)
+/// 广度优先遍历目录树。单协程执行，每层目录：
+/// 1. 获取 global_sem permit → list 云端 + 读本地
+/// 2. 释放 permit
+/// 3. 对比结果，分发任务到 JoinSet（mkdir / hash+upload / upload / download）
+/// 4. 子目录加入 BFS 队列
+async fn bfs_walk(ctx: Arc<SyncCtx>, local_root: PathBuf, cloud_root: String) {
+    let mut queue: VecDeque<WalkItem> = VecDeque::new();
+    queue.push_back(WalkItem {
+        local_dir: local_root,
+        cloud_dir: cloud_root,
+        prefix: String::new(),
+        local_only: false,
     });
 
-    // 并行获取本地和云盘列表
-    let list_start = std::time::Instant::now();
-    let ld = local_dir.clone();
-    let excl = ctx.exclude.clone();
-    let local_handle = tokio::task::spawn_blocking(move || read_local_dir(&ld, &excl));
+    while let Some(item) = queue.pop_front() {
+        ctx.scan_pb.set_message(if item.prefix.is_empty() {
+            "/".to_string()
+        } else {
+            truncate_name(&item.prefix, 50)
+        });
 
-    let cloud_items = if local_only {
-        Vec::new()
-    } else {
-        ctx.client.list_all_quiet(&cloud_dir).await.unwrap_or_default()
-    };
+        // ── 获取 permit → list ──
+        let list_start = std::time::Instant::now();
+        let _permit = ctx.global_sem.acquire().await.unwrap();
 
-    let local_entries = local_handle.await.unwrap_or_default();
-    let list_elapsed = list_start.elapsed();
+        let ld = item.local_dir.clone();
+        let excl = ctx.exclude.clone();
+        let local_handle = tokio::task::spawn_blocking(move || read_local_dir(&ld, &excl));
 
-    tracing::info!(
-        dir = %prefix, local_count = local_entries.len(), cloud_count = cloud_items.len(),
-        list_ms = list_elapsed.as_millis() as u64,
-        "scan_dir listed"
-    );
+        let cloud_items = if item.local_only {
+            Vec::new()
+        } else {
+            ctx.client.list_all_quiet(&item.cloud_dir).await.unwrap_or_default()
+        };
 
-    let local_map: HashMap<&str, &LocalEntry> =
-        local_entries.iter().map(|e| (e.name.as_str(), e)).collect();
-    let cloud_map: HashMap<&str, &ListItem> =
-        cloud_items.iter().map(|e| (e.name.as_str(), e)).collect();
+        let local_entries = local_handle.await.unwrap_or_default();
 
-    let ct = &ctx.cloud_root;
+        // 释放 permit — list 完成，后续分发不需要持有
+        drop(_permit);
 
-    match ctx.direction {
-        SyncDirection::LocalToCloud => {
-            // ── Phase A: 对比，收集结果 ──
-            struct DirInfo { name: String, cloud_path: String, is_new: bool }
-            struct FileInfo { local: PathBuf, cloud_dir: String }
+        let list_elapsed = list_start.elapsed();
+        tracing::info!(
+            dir = %item.prefix, local_count = local_entries.len(), cloud_count = cloud_items.len(),
+            list_ms = list_elapsed.as_millis() as u64,
+            "scan_dir listed"
+        );
 
-            let mut new_dirs: Vec<DirInfo> = Vec::new();
-            let mut to_upload: Vec<FileInfo> = Vec::new();
-            let mut skip_count: u32 = 0;
+        // ── 对比 + 分发 ──
+        let local_map: HashMap<&str, &LocalEntry> =
+            local_entries.iter().map(|e| (e.name.as_str(), e)).collect();
+        let cloud_map: HashMap<&str, &ListItem> =
+            cloud_items.iter().map(|e| (e.name.as_str(), e)).collect();
 
-            for le in local_entries.iter().filter(|e| e.is_dir) {
-                let cloud_path = rel_cloud(ct, &prefix, &le.name);
-                let is_new = !cloud_map.contains_key(le.name.as_str());
-                new_dirs.push(DirInfo { name: le.name.clone(), cloud_path, is_new });
+        let ct = &ctx.cloud_root;
+
+        match ctx.direction {
+            SyncDirection::LocalToCloud => {
+                walk_local_to_cloud(
+                    &ctx, &item, ct, &local_entries, &cloud_items,
+                    &local_map, &cloud_map, &mut queue,
+                ).await;
             }
-
-            // 需要 hash 比较的文件（same size，云盘有 content_hash）
-            struct HashCheck { local: PathBuf, cloud_dir: String, cloud_hash: String }
-            let mut to_hash_check: Vec<HashCheck> = Vec::new();
-
-            for le in local_entries.iter().filter(|e| !e.is_dir) {
-                match cloud_map.get(le.name.as_str()) {
-                    None => {
-                        to_upload.push(FileInfo {
-                            local: local_dir.join(&le.name),
-                            cloud_dir: cloud_dir.clone(),
-                        });
-                    }
-                    Some(ci) if ci.size != le.size as i64 => {
-                        let cloud_mtime = parse_cloud_mtime_ms(&ci.updated_at);
-                        if le.mtime_ms >= cloud_mtime {
-                            to_upload.push(FileInfo {
-                                local: local_dir.join(&le.name),
-                                cloud_dir: cloud_dir.clone(),
-                            });
-                        } else {
-                            tracing::debug!(file = %le.name, "skip: cloud is newer");
-                            skip_count += 1;
-                        }
-                    }
-                    Some(ci) => {
-                        // same size → 用 hash 判别
-                        if !ci.content_hash.is_empty() {
-                            to_hash_check.push(HashCheck {
-                                local: local_dir.join(&le.name),
-                                cloud_dir: cloud_dir.clone(),
-                                cloud_hash: ci.content_hash.clone(),
-                            });
-                        } else {
-                            skip_count += 1;
-                        }
-                    }
-                }
-            }
-
-            // ── Phase B: 更新进度条（download_only 时跳过上传） ──
-            tracing::info!(
-                dir = %prefix, to_upload = to_upload.len(), to_hash = to_hash_check.len(),
-                skipped = skip_count, sub_dirs = new_dirs.len(),
-                "scan_dir decision"
-            );
-            if ctx.download_only {
-                ctx.skipped.fetch_add(to_upload.len() as u32, Ordering::Relaxed);
-                to_upload.clear();
-            }
-            if !to_upload.is_empty() {
-                ctx.overall_pb.inc_length(to_upload.len() as u64);
-            }
-            ctx.skipped.fetch_add(skip_count, Ordering::Relaxed);
-
-            // hash 检查 → spawn 到 JoinSet 独立协程（利用 global_sem 并行）
-            if !ctx.download_only {
-                for hc in to_hash_check {
-                    push_hash_then_upload(&ctx, hc.local, hc.cloud_dir, hc.cloud_hash).await;
-                }
-            } else {
-                ctx.skipped.fetch_add(to_hash_check.len() as u32, Ordering::Relaxed);
-            }
-
-            // ── Phase C: 并行创建目录 + spawn 子目录 scan ──
-            // 先并行创建所有新目录
-            let new_dir_paths: Vec<&DirInfo> = new_dirs.iter().filter(|d| d.is_new).collect();
-            if !new_dir_paths.is_empty() {
-                ctx.scan_pb.set_message(format!("📁 creating {} dirs", new_dir_paths.len()));
-                let mkdir_futures: Vec<_> = new_dir_paths.iter().map(|d| {
-                    let client = ctx.client.clone();
-                    let path = d.cloud_path.clone();
-                    async move {
-                        (client.ensure_dir(&path).await, path)
-                    }
-                }).collect();
-                let results = futures_util::future::join_all(mkdir_futures).await;
-                for (result, path) in results {
-                    match result {
-                        Ok(_) => { ctx.dirs_created.fetch_add(1, Ordering::Relaxed); }
-                        Err(e) => {
-                            tracing::error!(err = %e, dir = %path, "mkdir cloud failed");
-                            ctx.failed.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                }
-            }
-
-            // 再 spawn 子目录 scan
-            let mut sub_handles = Vec::new();
-            for d in &new_dirs {
-                let ctx2 = ctx.clone();
-                let sub_local = local_dir.join(&d.name);
-                let cp = d.cloud_path.clone();
-                let sp = rel_path(&prefix, &d.name);
-                let lo = d.is_new;
-                sub_handles.push(tokio::spawn(async move {
-                    scan_dir(ctx2, sub_local, cp, sp, lo).await;
-                }));
-            }
-
-            // ── Phase D: 排队提交传输到 JoinSet ──
-            for f in to_upload {
-                push_upload(&ctx, f.local, f.cloud_dir).await;
-            }
-
-            // ── Phase E: 收集删除 ──
-            if ctx.delete {
-                for ci in &cloud_items {
-                    if !local_map.contains_key(ci.name.as_str()) {
-                        let cloud = rel_cloud(ct, &prefix, &ci.name);
-                        if ci.is_folder {
-                            collect_cloud_deletes(&ctx.client, &cloud, &ctx.pending_deletes).await;
-                        }
-                        ctx.pending_deletes.lock().await.push(SyncAction::DeleteCloud { cloud });
-                    }
-                }
-            }
-
-            // ── Phase F: 等待子目录 scan 完成 ──
-            for h in sub_handles {
-                let _ = h.await;
-            }
-        }
-        SyncDirection::CloudToLocal => {
-            // ── Phase A: 对比，收集结果 ──
-            struct DirInfo { name: String, is_new: bool }
-            struct FileInfo { cloud: String, local: PathBuf, size: u64 }
-
-            let mut new_dirs: Vec<DirInfo> = Vec::new();
-            let mut to_download: Vec<FileInfo> = Vec::new();
-            let mut skip_count: u32 = 0;
-
-            for ci in cloud_items.iter().filter(|e| e.is_folder) {
-                let is_new = !local_map.contains_key(ci.name.as_str());
-                new_dirs.push(DirInfo { name: ci.name.clone(), is_new });
-            }
-
-            struct HashCheck { cloud: String, local: PathBuf, size: u64, cloud_hash: String }
-            let mut to_hash_check: Vec<HashCheck> = Vec::new();
-
-            for ci in cloud_items.iter().filter(|e| !e.is_folder) {
-                match local_map.get(ci.name.as_str()) {
-                    None => {
-                        to_download.push(FileInfo {
-                            cloud: rel_cloud(ct, &prefix, &ci.name),
-                            local: local_dir.join(&ci.name),
-                            size: ci.size as u64,
-                        });
-                    }
-                    Some(le) if le.size as i64 != ci.size => {
-                        let cloud_mtime = parse_cloud_mtime_ms(&ci.updated_at);
-                        if cloud_mtime >= le.mtime_ms {
-                            to_download.push(FileInfo {
-                                cloud: rel_cloud(ct, &prefix, &ci.name),
-                                local: local_dir.join(&ci.name),
-                                size: ci.size as u64,
-                            });
-                        } else {
-                            tracing::debug!(file = %ci.name, "skip: local is newer");
-                            skip_count += 1;
-                        }
-                    }
-                    Some(_le) => {
-                        if !ci.content_hash.is_empty() {
-                            to_hash_check.push(HashCheck {
-                                cloud: rel_cloud(ct, &prefix, &ci.name),
-                                local: local_dir.join(&ci.name),
-                                size: ci.size as u64,
-                                cloud_hash: ci.content_hash.clone(),
-                            });
-                        } else {
-                            skip_count += 1;
-                        }
-                    }
-                }
-            }
-
-            // ── Phase B: 更新进度条（upload_only 时跳过下载） ──
-            if ctx.upload_only {
-                ctx.skipped.fetch_add(to_download.len() as u32, Ordering::Relaxed);
-                to_download.clear();
-            }
-            if !to_download.is_empty() {
-                ctx.overall_pb.inc_length(to_download.len() as u64);
-            }
-            ctx.skipped.fetch_add(skip_count, Ordering::Relaxed);
-
-            // hash 检查 → spawn 到 JoinSet 独立协程（利用 global_sem 并行）
-            if !ctx.upload_only {
-                let parallel = ctx.parallel;
-                for hc in to_hash_check {
-                    push_hash_then_download(&ctx, hc.cloud, hc.local, hc.size, hc.cloud_hash, parallel).await;
-                }
-            } else {
-                ctx.skipped.fetch_add(to_hash_check.len() as u32, Ordering::Relaxed);
-            }
-
-            // ── Phase C: 创建目录 + spawn 子目录 scan ──
-            let mut sub_handles = Vec::new();
-            for d in &new_dirs {
-                if d.is_new {
-                    let lp = local_dir.join(&d.name);
-                    ctx.scan_pb.set_message(format!("📁 {}", lp.display()));
-                    match tokio::fs::create_dir_all(&lp).await {
-                        Ok(_) => { ctx.dirs_created.fetch_add(1, Ordering::Relaxed); }
-                        Err(e) => {
-                            tracing::error!(err = %e, dir = %lp.display(), "mkdir local failed");
-                            ctx.failed.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                }
-                let ctx2 = ctx.clone();
-                let sub_local = local_dir.join(&d.name);
-                let sub_cloud = rel_cloud(ct, &prefix, &d.name);
-                let sp = rel_path(&prefix, &d.name);
-                sub_handles.push(tokio::spawn(async move {
-                    scan_dir(ctx2, sub_local, sub_cloud, sp, false).await;
-                }));
-            }
-
-            // ── Phase D: 排队提交传输到 JoinSet ──
-            for f in to_download {
-                push_download(&ctx, f.cloud, f.local, f.size).await;
-            }
-
-            // ── Phase E: 收集删除 ──
-            if ctx.delete {
-                for le in &local_entries {
-                    if !cloud_map.contains_key(le.name.as_str()) {
-                        ctx.pending_deletes.lock().await.push(SyncAction::DeleteLocal {
-                            local: local_dir.join(&le.name),
-                        });
-                    }
-                }
-            }
-
-            // ── Phase F: 等待子目录 scan 完成 ──
-            for h in sub_handles {
-                let _ = h.await;
+            SyncDirection::CloudToLocal => {
+                walk_cloud_to_local(
+                    &ctx, &item, ct, &local_entries, &cloud_items,
+                    &local_map, &cloud_map, &mut queue,
+                ).await;
             }
         }
     }
 }
 
-// ── JoinSet push（global_sem 控制并发） ──
+/// LocalToCloud: 对比本地 vs 云端，分发 mkdir / upload / hash+upload
+async fn walk_local_to_cloud(
+    ctx: &Arc<SyncCtx>,
+    item: &WalkItem,
+    ct: &str,
+    local_entries: &[LocalEntry],
+    cloud_items: &[ListItem],
+    local_map: &HashMap<&str, &LocalEntry>,
+    cloud_map: &HashMap<&str, &ListItem>,
+    queue: &mut VecDeque<WalkItem>,
+) {
+    struct FileInfo { local: PathBuf, cloud_dir: String }
+    struct HashCheck { local: PathBuf, cloud_dir: String, cloud_hash: String }
 
-/// 推入上传任务到 JoinSet。并发由 global_sem 控制。
+    let mut to_upload: Vec<FileInfo> = Vec::new();
+    let mut to_hash_check: Vec<HashCheck> = Vec::new();
+    let mut skip_count: u32 = 0;
+
+    // 收集需要创建的新目录
+    struct DirInfo { name: String, cloud_path: String, is_new: bool }
+    let mut dirs: Vec<DirInfo> = Vec::new();
+
+    for le in local_entries.iter().filter(|e| e.is_dir) {
+        let cloud_path = rel_cloud(ct, &item.prefix, &le.name);
+        let is_new = !cloud_map.contains_key(le.name.as_str());
+        dirs.push(DirInfo { name: le.name.clone(), cloud_path, is_new });
+    }
+
+    // 文件对比
+    for le in local_entries.iter().filter(|e| !e.is_dir) {
+        match cloud_map.get(le.name.as_str()) {
+            None => {
+                to_upload.push(FileInfo {
+                    local: item.local_dir.join(&le.name),
+                    cloud_dir: item.cloud_dir.clone(),
+                });
+            }
+            Some(ci) if ci.size != le.size as i64 => {
+                let cloud_mtime = parse_cloud_mtime_ms(&ci.updated_at);
+                if le.mtime_ms >= cloud_mtime {
+                    to_upload.push(FileInfo {
+                        local: item.local_dir.join(&le.name),
+                        cloud_dir: item.cloud_dir.clone(),
+                    });
+                } else {
+                    tracing::debug!(file = %le.name, "skip: cloud is newer");
+                    skip_count += 1;
+                }
+            }
+            Some(ci) => {
+                if !ci.content_hash.is_empty() {
+                    to_hash_check.push(HashCheck {
+                        local: item.local_dir.join(&le.name),
+                        cloud_dir: item.cloud_dir.clone(),
+                        cloud_hash: ci.content_hash.clone(),
+                    });
+                } else {
+                    skip_count += 1;
+                }
+            }
+        }
+    }
+
+    tracing::info!(
+        dir = %item.prefix, to_upload = to_upload.len(), to_hash = to_hash_check.len(),
+        skipped = skip_count, sub_dirs = dirs.len(),
+        "scan_dir decision"
+    );
+
+    // 更新进度条
+    if ctx.download_only {
+        ctx.skipped.fetch_add(to_upload.len() as u32, Ordering::Relaxed);
+        to_upload.clear();
+    }
+    if !to_upload.is_empty() {
+        ctx.overall_pb.inc_length(to_upload.len() as u64);
+    }
+    ctx.skipped.fetch_add(skip_count, Ordering::Relaxed);
+
+    // 分发 hash 检查任务
+    if !ctx.download_only {
+        for hc in to_hash_check {
+            push_hash_then_upload(ctx, hc.local, hc.cloud_dir, hc.cloud_hash).await;
+        }
+    } else {
+        ctx.skipped.fetch_add(to_hash_check.len() as u32, Ordering::Relaxed);
+    }
+
+    // 并行创建新目录
+    let new_dir_paths: Vec<&DirInfo> = dirs.iter().filter(|d| d.is_new).collect();
+    if !new_dir_paths.is_empty() {
+        ctx.scan_pb.set_message(format!("📁 creating {} dirs", new_dir_paths.len()));
+        let mkdir_futures: Vec<_> = new_dir_paths.iter().map(|d| {
+            let client = ctx.client.clone();
+            let path = d.cloud_path.clone();
+            async move { (client.ensure_dir(&path).await, path) }
+        }).collect();
+        let results = futures_util::future::join_all(mkdir_futures).await;
+        for (result, path) in results {
+            match result {
+                Ok(_) => { ctx.dirs_created.fetch_add(1, Ordering::Relaxed); }
+                Err(e) => {
+                    tracing::error!(err = %e, dir = %path, "mkdir cloud failed");
+                    ctx.failed.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    // 子目录加入 BFS 队列
+    for d in &dirs {
+        queue.push_back(WalkItem {
+            local_dir: item.local_dir.join(&d.name),
+            cloud_dir: d.cloud_path.clone(),
+            prefix: rel_path(&item.prefix, &d.name),
+            local_only: d.is_new,
+        });
+    }
+
+    // 分发上传任务
+    for f in to_upload {
+        push_upload(ctx, f.local, f.cloud_dir).await;
+    }
+
+    // 收集删除
+    if ctx.delete {
+        for ci in cloud_items {
+            if !local_map.contains_key(ci.name.as_str()) {
+                let cloud = rel_cloud(ct, &item.prefix, &ci.name);
+                if ci.is_folder {
+                    collect_cloud_deletes(&ctx.client, &cloud, &ctx.pending_deletes).await;
+                }
+                ctx.pending_deletes.lock().await.push(SyncAction::DeleteCloud { cloud });
+            }
+        }
+    }
+}
+
+/// CloudToLocal: 对比云端 vs 本地，分发 mkdir / download / hash+download
+async fn walk_cloud_to_local(
+    ctx: &Arc<SyncCtx>,
+    item: &WalkItem,
+    ct: &str,
+    local_entries: &[LocalEntry],
+    cloud_items: &[ListItem],
+    local_map: &HashMap<&str, &LocalEntry>,
+    cloud_map: &HashMap<&str, &ListItem>,
+    queue: &mut VecDeque<WalkItem>,
+) {
+    struct FileInfo { cloud: String, local: PathBuf, size: u64 }
+    struct HashCheck { cloud: String, local: PathBuf, size: u64, cloud_hash: String }
+
+    let mut to_download: Vec<FileInfo> = Vec::new();
+    let mut to_hash_check: Vec<HashCheck> = Vec::new();
+    let mut skip_count: u32 = 0;
+
+    struct DirInfo { name: String, is_new: bool }
+    let mut dirs: Vec<DirInfo> = Vec::new();
+
+    for ci in cloud_items.iter().filter(|e| e.is_folder) {
+        let is_new = !local_map.contains_key(ci.name.as_str());
+        dirs.push(DirInfo { name: ci.name.clone(), is_new });
+    }
+
+    for ci in cloud_items.iter().filter(|e| !e.is_folder) {
+        match local_map.get(ci.name.as_str()) {
+            None => {
+                to_download.push(FileInfo {
+                    cloud: rel_cloud(ct, &item.prefix, &ci.name),
+                    local: item.local_dir.join(&ci.name),
+                    size: ci.size as u64,
+                });
+            }
+            Some(le) if le.size as i64 != ci.size => {
+                let cloud_mtime = parse_cloud_mtime_ms(&ci.updated_at);
+                if cloud_mtime >= le.mtime_ms {
+                    to_download.push(FileInfo {
+                        cloud: rel_cloud(ct, &item.prefix, &ci.name),
+                        local: item.local_dir.join(&ci.name),
+                        size: ci.size as u64,
+                    });
+                } else {
+                    tracing::debug!(file = %ci.name, "skip: local is newer");
+                    skip_count += 1;
+                }
+            }
+            Some(_le) => {
+                if !ci.content_hash.is_empty() {
+                    to_hash_check.push(HashCheck {
+                        cloud: rel_cloud(ct, &item.prefix, &ci.name),
+                        local: item.local_dir.join(&ci.name),
+                        size: ci.size as u64,
+                        cloud_hash: ci.content_hash.clone(),
+                    });
+                } else {
+                    skip_count += 1;
+                }
+            }
+        }
+    }
+
+    // 更新进度条
+    if ctx.upload_only {
+        ctx.skipped.fetch_add(to_download.len() as u32, Ordering::Relaxed);
+        to_download.clear();
+    }
+    if !to_download.is_empty() {
+        ctx.overall_pb.inc_length(to_download.len() as u64);
+    }
+    ctx.skipped.fetch_add(skip_count, Ordering::Relaxed);
+
+    // 分发 hash 检查任务
+    if !ctx.upload_only {
+        let parallel = ctx.parallel;
+        for hc in to_hash_check {
+            push_hash_then_download(ctx, hc.cloud, hc.local, hc.size, hc.cloud_hash, parallel).await;
+        }
+    } else {
+        ctx.skipped.fetch_add(to_hash_check.len() as u32, Ordering::Relaxed);
+    }
+
+    // 创建本地目录（本地 IO 很快，直接串行即可）
+    for d in &dirs {
+        if d.is_new {
+            let lp = item.local_dir.join(&d.name);
+            ctx.scan_pb.set_message(format!("📁 {}", lp.display()));
+            match tokio::fs::create_dir_all(&lp).await {
+                Ok(_) => { ctx.dirs_created.fetch_add(1, Ordering::Relaxed); }
+                Err(e) => {
+                    tracing::error!(err = %e, dir = %lp.display(), "mkdir local failed");
+                    ctx.failed.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    // 子目录加入 BFS 队列
+    for d in &dirs {
+        queue.push_back(WalkItem {
+            local_dir: item.local_dir.join(&d.name),
+            cloud_dir: rel_cloud(ct, &item.prefix, &d.name),
+            prefix: rel_path(&item.prefix, &d.name),
+            local_only: false,
+        });
+    }
+
+    // 分发下载任务
+    for f in to_download {
+        push_download(ctx, f.cloud, f.local, f.size).await;
+    }
+
+    // 收集删除
+    if ctx.delete {
+        for le in local_entries {
+            if !cloud_map.contains_key(le.name.as_str()) {
+                ctx.pending_deletes.lock().await.push(SyncAction::DeleteLocal {
+                    local: item.local_dir.join(&le.name),
+                });
+            }
+        }
+    }
+}
+
+// ── Stage 2: Worker 任务分发 ──
+
 async fn push_upload(ctx: &Arc<SyncCtx>, local: PathBuf, cloud_dir: String) {
     let ctx2 = ctx.clone();
     let global = ctx.global_sem.clone();
     let mut js = ctx.join_set.lock().await;
     js.spawn(async move {
-        let _global_permit = global.acquire().await.unwrap();
+        let _permit = global.acquire().await.unwrap();
         do_upload_task(&ctx2, local, cloud_dir).await;
     });
 }
 
-/// 推入下载任务到 JoinSet。并发由 global_sem 控制。
 async fn push_download(ctx: &Arc<SyncCtx>, cloud: String, local: PathBuf, est_size: u64) {
     let ctx2 = ctx.clone();
     let global = ctx.global_sem.clone();
     let parallel = ctx.parallel;
     let mut js = ctx.join_set.lock().await;
     js.spawn(async move {
-        let _global_permit = global.acquire().await.unwrap();
+        let _permit = global.acquire().await.unwrap();
         do_download_task(&ctx2, cloud, local, est_size, parallel).await;
     });
 }
 
-/// 推入 hash 校验 + 上传任务到 JoinSet。
-/// 先计算本地 SHA256，与云盘 hash 对比；不匹配则上传，匹配则跳过。
 async fn push_hash_then_upload(ctx: &Arc<SyncCtx>, local: PathBuf, cloud_dir: String, cloud_hash: String) {
     let ctx2 = ctx.clone();
     let global = ctx.global_sem.clone();
     let mut js = ctx.join_set.lock().await;
     js.spawn(async move {
-        let wait_start = std::time::Instant::now();
-        let _global_permit = global.acquire().await.unwrap();
-        let wait_elapsed = wait_start.elapsed();
-
+        let _permit = global.acquire().await.unwrap();
         let hash_start = std::time::Instant::now();
         let path = local.clone();
         let local_hash = tokio::task::spawn_blocking(move || compute_sha256_hex(&path))
             .await.unwrap_or_default();
-        let hash_elapsed = hash_start.elapsed();
+        let hash_ms = hash_start.elapsed().as_millis() as u64;
 
         let name = local.file_name().unwrap_or_default().to_string_lossy().to_string();
         if local_hash != cloud_hash {
-            tracing::debug!(file = %name, wait_ms = wait_elapsed.as_millis() as u64,
-                hash_ms = hash_elapsed.as_millis() as u64, "hash mismatch → upload");
+            tracing::debug!(file = %name, hash_ms, "hash mismatch → upload");
             ctx2.overall_pb.inc_length(1);
             do_upload_task(&ctx2, local, cloud_dir).await;
         } else {
-            tracing::info!(file = %name, wait_ms = wait_elapsed.as_millis() as u64,
-                hash_ms = hash_elapsed.as_millis() as u64, "hash match → skip");
+            tracing::info!(file = %name, hash_ms, "hash match → skip");
             ctx2.skipped.fetch_add(1, Ordering::Relaxed);
         }
     });
 }
 
-/// 推入 hash 校验 + 下载任务到 JoinSet。
-/// 先计算本地 SHA256，与云盘 hash 对比；不匹配则下载，匹配则跳过。
 async fn push_hash_then_download(ctx: &Arc<SyncCtx>, cloud: String, local: PathBuf, est_size: u64, cloud_hash: String, parallel: usize) {
     let ctx2 = ctx.clone();
     let global = ctx.global_sem.clone();
     let mut js = ctx.join_set.lock().await;
     js.spawn(async move {
-        let wait_start = std::time::Instant::now();
-        let _global_permit = global.acquire().await.unwrap();
-        let wait_elapsed = wait_start.elapsed();
-
+        let _permit = global.acquire().await.unwrap();
         let hash_start = std::time::Instant::now();
         let path = local.clone();
         let local_hash = tokio::task::spawn_blocking(move || compute_sha256_hex(&path))
             .await.unwrap_or_default();
-        let hash_elapsed = hash_start.elapsed();
+        let hash_ms = hash_start.elapsed().as_millis() as u64;
 
         let name = local.file_name().unwrap_or_default().to_string_lossy().to_string();
         if local_hash != cloud_hash {
-            tracing::debug!(file = %name, wait_ms = wait_elapsed.as_millis() as u64,
-                hash_ms = hash_elapsed.as_millis() as u64, "hash mismatch → download");
+            tracing::debug!(file = %name, hash_ms, "hash mismatch → download");
             ctx2.overall_pb.inc_length(1);
             do_download_task(&ctx2, cloud, local, est_size, parallel).await;
         } else {
-            tracing::info!(file = %name, wait_ms = wait_elapsed.as_millis() as u64,
-                hash_ms = hash_elapsed.as_millis() as u64, "hash match → skip");
+            tracing::info!(file = %name, hash_ms, "hash match → skip");
             ctx2.skipped.fetch_add(1, Ordering::Relaxed);
         }
     });
@@ -842,8 +828,6 @@ async fn collect_cloud_deletes(
     }
 }
 
-// ── Yun139Client 辅助 ──
-
 impl Yun139Client {
     async fn list_all_quiet(&self, cloud_dir: &str) -> Result<Vec<ListItem>> {
         match self.list_all(cloud_dir).await {
@@ -859,7 +843,6 @@ struct LocalEntry {
     name: String,
     is_dir: bool,
     size: u64,
-    /// 修改时间（毫秒时间戳，0 表示无法获取）
     mtime_ms: i64,
 }
 
@@ -885,22 +868,13 @@ fn read_local_dir(dir: &Path, exclude: &[String]) -> Vec<LocalEntry> {
     entries
 }
 
-/// 检查文件名是否匹配排除模式。
-///
-/// 支持:
-///   精确匹配:   `.DS_Store`
-///   前缀通配:   `._*`    → 匹配 `._Photo.jpg` 等
-///   后缀通配:   `*.store` → 匹配 `abc.store` 等
-///   隐藏文件:   `.*`     → 匹配所有 `.` 开头文件
 fn is_excluded(name: &str, patterns: &[String]) -> bool {
     for pat in patterns {
         if pat == ".*" {
             if name.starts_with('.') { return true; }
         } else if let Some(suffix) = pat.strip_prefix('*') {
-            // *.store, *.tmp
             if name.ends_with(suffix) { return true; }
         } else if let Some(prefix) = pat.strip_suffix('*') {
-            // ._*
             if name.starts_with(prefix) { return true; }
         } else if pat == name {
             return true;
@@ -925,7 +899,6 @@ fn rel_cloud(ct: &str, prefix: &str, name: &str) -> String {
     if prefix.is_empty() { format!("{ct}/{name}") } else { format!("{ct}/{prefix}/{name}") }
 }
 
-/// 解析云盘 updated_at 字符串为毫秒时间戳。
 fn parse_cloud_mtime_ms(updated_at: &str) -> i64 {
     chrono::DateTime::parse_from_rfc3339(updated_at)
         .or_else(|_| chrono::DateTime::parse_from_str(updated_at, "%Y-%m-%dT%H:%M:%S%.f%:z"))
@@ -933,7 +906,6 @@ fn parse_cloud_mtime_ms(updated_at: &str) -> i64 {
         .unwrap_or(0)
 }
 
-/// 计算文件 SHA256（blocking，用于 spawn_blocking）。
 fn compute_sha256_hex(path: &Path) -> String {
     use digest::Digest;
     let mut file = match std::fs::File::open(path) {
