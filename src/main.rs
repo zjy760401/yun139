@@ -3,16 +3,8 @@ use std::sync::Arc;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
-/// 格式: 0.01.XXXX (主版本.子版本.提交次数)
 fn version_string() -> &'static str {
-    // commit count 由 build.rs 在编译时注入
-    const COMMIT_COUNT: &str = env!("GIT_COMMIT_COUNT");
-
-    // 用 const + macro 无法拼接，运行时 leak 一次即可
-    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    VERSION.get_or_init(|| {
-        format!("0.01.{:0>4}", COMMIT_COUNT)
-    })
+    env!("CARGO_PKG_VERSION")
 }
 
 /// 中国移动云盘 (139网盘) CLI
