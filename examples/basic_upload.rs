@@ -20,7 +20,7 @@ async fn main() {
         &args[1],
         &args[2],
         &args[3],
-        |uploaded, total| {
+        move |uploaded, total| {
             let last = last_printed.load(Ordering::Relaxed);
             if uploaded - last >= 1_048_576 || uploaded >= total {
                 last_printed.store(uploaded, Ordering::Relaxed);

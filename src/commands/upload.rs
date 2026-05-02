@@ -149,7 +149,7 @@ impl Yun139Client {
         // 秒传：服务器已有同 SHA256 的文件，无需真正上传
         if data.rapid_upload.unwrap_or(false)
             || upload_id.is_empty()
-            || data.part_infos.as_ref().map_or(false, |p| p.is_empty())
+            || data.part_infos.as_ref().is_some_and(|p| p.is_empty())
         {
             tracing::debug!(file = %file_name, file_id = %file_id, "rapid upload success");
             on_progress(file_size, file_size);
@@ -246,7 +246,7 @@ async fn compute_sha256(path: &std::path::Path) -> Result<(String, u64)> {
         Ok::<(String, u64), std::io::Error>((hex::encode(hasher.finalize()), total))
     })
     .await
-    .map_err(|e| Yun139Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))??;
+    .map_err(|e| Yun139Error::Io(std::io::Error::other(e)))??;
     Ok(result)
 }
 

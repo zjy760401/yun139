@@ -82,7 +82,7 @@ impl Yun139Client {
             .ok()
             .and_then(|bytes| String::from_utf8(bytes).ok())
             .map(|s| {
-                s.splitn(3, ':')
+                s.split(':')
                     .nth(1)
                     .unwrap_or_default()
                     .to_string()

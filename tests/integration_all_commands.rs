@@ -40,6 +40,15 @@ const DOWNLOAD_PARALLEL: usize = 4;
 
 // ── 辅助函数 ──
 
+/// 初始化测试日志：输出到终端，不写文件，level = INFO。
+/// 使用 try_init 避免多个测试并行时重复初始化报错。
+fn init_test_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_test_writer()
+        .try_init();
+}
+
 /// 获取认证信息：优先环境变量，回退到系统配置文件。
 fn get_auth() -> Option<String> {
     if let Ok(env) = std::env::var("YUN139_AUTH") {
@@ -115,14 +124,27 @@ fn sha256_file(path: &std::path::Path) -> String {
 
 #[tokio::test]
 async fn sdk_all_commands() {
+    init_test_tracing();
+
+    tracing::info!("══════════════════════════════════════════════════════════════════");
+    tracing::info!("  sdk_all_commands");
+    tracing::info!("  通过 SDK API 全量集成测试，覆盖以下命令：");
+    tracing::info!("  list · mkdir · upload(小/大) · list · search ·");
+    tracing::info!("  download(单流/并行) · trash · delete · list · error cases");
+    tracing::info!("  使用独立时间戳目录隔离，测试结束自动清理云盘与本地临时文件");
+    tracing::info!("══════════════════════════════════════════════════════════════════");
+
     let auth = match get_auth() {
         Some(a) => a,
         None => {
-            eprintln!("⏭️  跳过: 未设置 YUN139_AUTH 且未找到系统配置 (~/.config/yun139/config.toml)");
+            tracing::warn!("⏭️  跳过: 未设置 YUN139_AUTH 且未找到系统配置 (~/.config/yun139/config.toml)");
             return;
         }
     };
-    eprintln!("🔑 认证来源: {}", if std::env::var("YUN139_AUTH").is_ok() { "环境变量" } else { "系统配置" });
+    tracing::info!(
+        source = if std::env::var("YUN139_AUTH").is_ok() { "环境变量" } else { "系统配置" },
+        "🔑 认证来源"
+    );
 
     let client = Yun139Client::new(&auth).expect("创建 client 失败");
 
@@ -148,24 +170,24 @@ async fn sdk_all_commands() {
     // ═══════════════════════════════════════════════
     // 1. list 根目录 — API 连通性
     // ═══════════════════════════════════════════════
-    eprintln!("\n── 1. list / ──");
+    tracing::info!("── 1. list / ──");
     let root = client.list_all("/").await.expect("list root failed");
-    eprintln!("   根目录 {} 个条目", root.items.len());
-    assert!(root.items.len() > 0 || root.items.is_empty(), "list 返回正常");
+    tracing::info!(count = root.items.len(), "根目录条目数");
+    // 只验证 API 调用成功（根目录可能为空）
 
     // ═══════════════════════════════════════════════
     // 2. mkdir — 单层 + 递归
     // ═══════════════════════════════════════════════
-    eprintln!("\n── 2. mkdir ──");
+    tracing::info!("── 2. mkdir ──");
 
     // 单层创建测试根目录
     let dir_id = client.mkdir(&test_dir).await.expect("mkdir test_dir failed");
-    eprintln!("   mkdir {test_dir} → {dir_id}");
+    tracing::info!(dir = %test_dir, file_id = %dir_id, "mkdir");
     assert!(!dir_id.is_empty(), "mkdir 应返回 fileId");
 
     // 递归创建多层子目录
     let sub_id = client.mkdir_recursive(&sub_dir).await.expect("mkdir_recursive failed");
-    eprintln!("   mkdir -r {sub_dir} → {sub_id}");
+    tracing::info!(dir = %sub_dir, file_id = %sub_id, "mkdir -r");
     assert!(!sub_id.is_empty(), "mkdir_recursive 应返回 fileId");
 
     // 验证 list 能看到子目录
@@ -176,9 +198,9 @@ async fn sdk_all_commands() {
     // ═══════════════════════════════════════════════
     // 3. upload — 小文件 (5MB, 单次 PUT)
     // ═══════════════════════════════════════════════
-    eprintln!("\n── 3. upload small file ({}MB) ──", SMALL_FILE_SIZE / 1024 / 1024);
+    tracing::info!(size_mb = SMALL_FILE_SIZE / 1024 / 1024, "── 3. upload small file");
     let small_hash = generate_random_file(&small_local, SMALL_FILE_SIZE);
-    eprintln!("   SHA256: {small_hash}");
+    tracing::info!(sha256 = %small_hash, "小文件 SHA256");
 
     let progress = Arc::new(AtomicU64::new(0));
     let p = progress.clone();
@@ -188,7 +210,7 @@ async fn sdk_all_commands() {
         })
         .await
         .expect("upload small file failed");
-    eprintln!("   fileId: {small_file_id}");
+    tracing::info!(file_id = %small_file_id, "小文件上传完成");
     assert!(!small_file_id.is_empty(), "upload 应返回 fileId");
     assert!(
         progress.load(Ordering::Relaxed) > 0,
@@ -198,9 +220,9 @@ async fn sdk_all_commands() {
     // ═══════════════════════════════════════════════
     // 4. upload — 大文件 (15MB, 分片上传)
     // ═══════════════════════════════════════════════
-    eprintln!("\n── 4. upload large file ({}MB) ──", LARGE_FILE_SIZE / 1024 / 1024);
+    tracing::info!(size_mb = LARGE_FILE_SIZE / 1024 / 1024, "── 4. upload large file");
     let large_hash = generate_random_file(&large_local, LARGE_FILE_SIZE);
-    eprintln!("   SHA256: {large_hash}");
+    tracing::info!(sha256 = %large_hash, "大文件 SHA256");
 
     let progress = Arc::new(AtomicU64::new(0));
     let p = progress.clone();
@@ -210,15 +232,15 @@ async fn sdk_all_commands() {
         })
         .await
         .expect("upload large file failed");
-    eprintln!("   fileId: {large_file_id}");
+    tracing::info!(file_id = %large_file_id, "大文件上传完成");
     assert!(!large_file_id.is_empty());
 
     // ═══════════════════════════════════════════════
     // 5. list — 验证上传结果
     // ═══════════════════════════════════════════════
-    eprintln!("\n── 5. list test dir ──");
+    tracing::info!("── 5. list test dir ──");
     let dir_list = client.list_all(&test_dir).await.expect("list test_dir failed");
-    eprintln!("   {} 个条目", dir_list.items.len());
+    tracing::info!(count = dir_list.items.len(), "目录条目数");
 
     let small_found = dir_list.items.iter().find(|i| i.name == small_name);
     let large_found = dir_list.items.iter().find(|i| i.name == large_name);
@@ -235,25 +257,24 @@ async fn sdk_all_commands() {
     // ═══════════════════════════════════════════════
     // 6. search — 搜索文件名
     // ═══════════════════════════════════════════════
-    eprintln!("\n── 6. search ──");
+    tracing::info!("── 6. search ──");
     // 搜索使用时间戳作为关键词，应能命中刚上传的文件
     let search_kw = format!("{ts}");
     let search_result = client.search(&search_kw, 10).await.expect("search failed");
-    eprintln!("   搜索 '{search_kw}' → {} 个结果", search_result.items.len());
+    tracing::info!(keyword = %search_kw, count = search_result.items.len(), "搜索结果");
     // 搜索可能有索引延迟，至少验证 API 调用成功不报错
-    // 如果立即能搜到更好
     let found_small = search_result.items.iter().any(|i| i.name == small_name);
     let found_large = search_result.items.iter().any(|i| i.name == large_name);
     if found_small && found_large {
-        eprintln!("   ✅ 两个文件都搜到了");
+        tracing::info!("✅ 两个文件都搜到了");
     } else {
-        eprintln!("   ⚠️  搜索可能有索引延迟 (found_small={found_small}, found_large={found_large})");
+        tracing::warn!(found_small, found_large, "⚠️  搜索可能有索引延迟");
     }
 
     // ═══════════════════════════════════════════════
     // 7. download — 单流下载小文件 + 校验
     // ═══════════════════════════════════════════════
-    eprintln!("\n── 7. download small (single stream) ──");
+    tracing::info!("── 7. download small (single stream) ──");
     let dl_small = tmp.join(format!("dl_{small_name}"));
 
     let dl_url = client
@@ -270,12 +291,12 @@ async fn sdk_all_commands() {
 
     let dl_small_hash = sha256_file(&dl_small);
     assert_eq!(dl_small_hash, small_hash, "小文件 SHA256 不匹配");
-    eprintln!("   ✅ SHA256 一致");
+    tracing::info!("✅ 小文件 SHA256 一致");
 
     // ═══════════════════════════════════════════════
     // 8. download — 并行下载大文件 + 校验
     // ═══════════════════════════════════════════════
-    eprintln!("\n── 8. download large (parallel) ──");
+    tracing::info!(parallel = DOWNLOAD_PARALLEL, "── 8. download large (parallel) ──");
     let dl_large = tmp.join(format!("dl_{large_name}"));
 
     let bytes = client
@@ -291,40 +312,58 @@ async fn sdk_all_commands() {
 
     let dl_large_hash = sha256_file(&dl_large);
     assert_eq!(dl_large_hash, large_hash, "大文件 SHA256 不匹配");
-    eprintln!("   ✅ SHA256 一致");
+    tracing::info!("✅ 大文件 SHA256 一致");
 
     // ═══════════════════════════════════════════════
     // 9. trash — 移入回收站
     // ═══════════════════════════════════════════════
-    eprintln!("\n── 9. trash large file ──");
+    tracing::info!("── 9. trash large file ──");
     client.trash(&format!("{test_dir}/{large_name}")).await.expect("trash failed");
-    eprintln!("   ✅ 已移入回收站");
+    tracing::info!("✅ 已移入回收站");
 
-    // 验证 list 中不再包含大文件
-    let after_trash = client.list_all(&test_dir).await.expect("list after trash failed");
-    let large_still = after_trash.items.iter().any(|i| i.name == large_name);
-    assert!(!large_still, "大文件应已从列表消失");
+    // 云端有最终一致性延迟，轮询等待大文件从列表消失（最多 5 次，间隔 1s）
+    let mut large_still = true;
+    for attempt in 1..=5u32 {
+        let after_trash = client.list_all(&test_dir).await.expect("list after trash failed");
+        large_still = after_trash.items.iter().any(|i| i.name == large_name);
+        if !large_still {
+            break;
+        }
+        tracing::info!(attempt, "大文件仍在列表，等待 1s 后重试");
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    assert!(!large_still, "大文件应已从列表消失（trash 后等待 5s 仍可见）");
 
     // ═══════════════════════════════════════════════
     // 10. delete — 永久删除小文件
     // ═══════════════════════════════════════════════
-    eprintln!("\n── 10. delete small file ──");
+    tracing::info!("── 10. delete small file ──");
     client.delete(&format!("{test_dir}/{small_name}")).await.expect("delete failed");
-    eprintln!("   ✅ 已永久删除");
+    tracing::info!("✅ 已永久删除");
+
+    // 同样等待一致性
+    let mut file_count = 1usize;
+    for attempt in 1..=5u32 {
+        let after_delete = client.list_all(&test_dir).await.expect("list after delete failed");
+        file_count = after_delete.items.iter().filter(|i| !i.is_folder).count();
+        if file_count == 0 {
+            tracing::info!(folder_count = after_delete.items.len(), "✅ 无文件残留");
+            break;
+        }
+        tracing::info!(attempt, remaining = file_count, "文件仍在列表，等待 1s 后重试");
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
 
     // ═══════════════════════════════════════════════
     // 11. list — 验证全部删除
     // ═══════════════════════════════════════════════
-    eprintln!("\n── 11. list after delete ──");
-    let after_delete = client.list_all(&test_dir).await.expect("list after delete failed");
-    let file_count = after_delete.items.iter().filter(|i| !i.is_folder).count();
-    assert_eq!(file_count, 0, "测试目录内应无文件");
-    eprintln!("   ✅ 无文件残留 ({} 个文件夹条目)", after_delete.items.len());
+    tracing::info!("── 11. list after delete ──");
+    assert_eq!(file_count, 0, "测试目录内应无文件（delete 后等待 5s 仍有残留）");
 
     // ═══════════════════════════════════════════════
     // 12. 边界 case — 错误路径测试
     // ═══════════════════════════════════════════════
-    eprintln!("\n── 12. error cases ──");
+    tracing::info!("── 12. error cases ──");
 
     // resolve_path 对不存在的路径
     let not_found = client
@@ -332,7 +371,7 @@ async fn sdk_all_commands() {
         .await;
     assert!(not_found.is_err(), "不存在路径应返回 Err");
     match not_found.unwrap_err() {
-        Yun139Error::PathNotFound(_) => eprintln!("   ✅ PathNotFound 正确"),
+        Yun139Error::PathNotFound(_) => tracing::info!("✅ PathNotFound 正确"),
         other => panic!("期望 PathNotFound, 得到 {other:?}"),
     }
 
@@ -342,25 +381,24 @@ async fn sdk_all_commands() {
         .await;
     assert!(dl_dir.is_err(), "下载目录应返回 Err");
     match dl_dir.unwrap_err() {
-        Yun139Error::IsDirectory(_) => eprintln!("   ✅ IsDirectory 正确"),
+        Yun139Error::IsDirectory(_) => tracing::info!("✅ IsDirectory 正确"),
         other => panic!("期望 IsDirectory, 得到 {other:?}"),
     }
 
     // ═══════════════════════════════════════════════
-    // 13. cleanup
+    // 13. cleanup — 永久删除测试目录（不留回收站残留）
     // ═══════════════════════════════════════════════
-    eprintln!("\n── 13. cleanup ──");
-    // 先删子目录内容，再删根
-    // trash sub/nested, sub, 最后 test_dir
-    let _ = client.trash(&sub_dir).await;
-    let _ = client.trash(&format!("{test_dir}/sub")).await;
-    let _ = client.trash(&test_dir).await;
-    eprintln!("   ✅ 云盘测试目录已清理");
+    tracing::info!("── 13. cleanup ──");
+    // 先删叶节点再删父节点，全部永久删除
+    let _ = client.delete(&sub_dir).await;
+    let _ = client.delete(&format!("{test_dir}/sub")).await;
+    let _ = client.delete(&test_dir).await;
+    tracing::info!("✅ 云盘测试目录已永久删除");
 
     // 显式触发 drop 前的清理
     drop(cleanup);
 
-    eprintln!("\n🎉 全部命令测试通过！");
+    tracing::info!("🎉 全部命令测试通过！");
 }
 
 // ── 清理守卫 ──

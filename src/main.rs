@@ -261,7 +261,7 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
 fn shellexpand_tilde(path: &str) -> String {
     if path.starts_with("~/") {
         if let Some(home) = dirs::home_dir() {
-            return format!("{}/{}", home.display(), &path[2..]);
+            return format!("{}/{}", home.display(), path.strip_prefix("~/").unwrap_or(path));
         }
     }
     path.to_string()
@@ -642,6 +642,7 @@ async fn do_delete(client: &yun139::Yun139Client, cloud_path: &str, permanent: b
 
 // ── sync ──
 
+#[allow(clippy::too_many_arguments)]
 async fn do_sync(client: &yun139::Yun139Client, src: &str, dest: &str, delete: bool, upload_only: bool, download_only: bool, checksum: bool, parallel: usize) {
     let src_is_cloud = src.starts_with("cloud:");
     let dest_is_cloud = dest.starts_with("cloud:");

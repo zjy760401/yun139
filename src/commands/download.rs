@@ -86,7 +86,7 @@ impl Yun139Client {
         on_progress(0, total);
 
         // 回退到单流
-        if !supports_range || total.map_or(true, |t| t < CHUNK_SIZE) {
+        if !supports_range || total.is_none_or(|t| t < CHUNK_SIZE) {
             return stream_download(self.transfer_http(), download_url, local_path, total, &on_progress).await;
         }
 
@@ -167,7 +167,7 @@ async fn chunked_download(
 
     let mut total_written: u64 = 0;
     for h in handles {
-        let n = h.await.map_err(|e| Yun139Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))??;
+        let n = h.await.map_err(|e| Yun139Error::Io(std::io::Error::other(e.to_string())))??;
         total_written += n;
     }
 
@@ -184,6 +184,7 @@ async fn chunked_download(
 }
 
 /// 下载一个 Range 分片并写入文件对应偏移，实时更新全局进度。
+#[allow(clippy::too_many_arguments)]
 async fn range_write_with_progress(
     http: &Client,
     url: &str,
@@ -254,7 +255,7 @@ async fn stream_download(
         return Ok(written);
     }
 
-    Err(last_err.unwrap_or_else(|| Yun139Error::Io(std::io::Error::new(std::io::ErrorKind::Other, "download failed after retries"))))
+    Err(last_err.unwrap_or_else(|| Yun139Error::Io(std::io::Error::other("download failed after retries"))))
 }
 
 async fn retry_sleep(attempt: u32) {

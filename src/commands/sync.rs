@@ -464,6 +464,7 @@ async fn scan_dir(
 ///
 /// 接受 owned 参数并返回 `impl Future + Send + 'static`（非 `async fn`），
 /// 使编译器能够静态验证 Future 的 Send 性，从而安全地传给 spawn_counted。
+#[allow(clippy::manual_async_fn, clippy::too_many_arguments)]
 fn walk_local_to_cloud(
     ctx: Arc<SyncCtx>,
     local_dir: PathBuf,
@@ -653,6 +654,7 @@ fn walk_local_to_cloud(
 /// CloudToLocal: 对比云端 vs 本地，分发 mkdir / download / hash+download
 ///
 /// 同 walk_local_to_cloud，接受 owned 参数并返回 `impl Future + Send + 'static`。
+#[allow(clippy::manual_async_fn)]
 fn walk_cloud_to_local(
     ctx: Arc<SyncCtx>,
     local_dir: PathBuf,
@@ -1115,28 +1117,4 @@ fn parse_cloud_mtime_ms(updated_at: &str) -> i64 {
         .unwrap_or(0)
 }
 
-fn compute_sha256_hex(path: &Path) -> String {
-    use digest::Digest;
-    let mut file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(e) => {
-            // 记录错误而不是静默返回空字符串（空字符串会被误当成 hash mismatch）
-            tracing::error!(path = %path.display(), err = %e, "compute_sha256_hex: failed to open file");
-            return String::new();
-        }
-    };
-    let mut hasher = sha2::Sha256::new();
-    let mut buf = vec![0u8; 2 * 1024 * 1024];
-    loop {
-        let n = match std::io::Read::read(&mut file, &mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) => {
-                tracing::error!(path = %path.display(), err = %e, "compute_sha256_hex: read error");
-                return String::new();
-            }
-        };
-        hasher.update(&buf[..n]);
-    }
-    hex::encode(hasher.finalize())
-}
+
