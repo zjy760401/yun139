@@ -4,7 +4,18 @@ use std::sync::Arc;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 fn version_string() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+    const COMMIT_COUNT: &str = env!("GIT_COMMIT_COUNT");
+    // 取 CARGO_PKG_VERSION 的前两段 (major.minor)，第三段用 git commit count 替换
+    const PKG_VER: &str = env!("CARGO_PKG_VERSION");
+
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| {
+        let prefix = PKG_VER
+            .rsplitn(2, '.')
+            .nth(1)
+            .unwrap_or(PKG_VER);
+        format!("{}.{}", prefix, COMMIT_COUNT)
+    })
 }
 
 /// 中国移动云盘 (139网盘) CLI
