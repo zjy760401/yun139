@@ -820,11 +820,13 @@ fn push_upload(ctx: &Arc<SyncCtx>, local: PathBuf, cloud_dir: String) {
         let name = local.file_name().unwrap_or_default().to_string_lossy().to_string();
 
         // Phase 1: 计算 SHA256 — 持有 hash_sem，不持有 global_sem
+        // sha256_file 同时返回文件大小（读取字节总数），
+        // 避免后续上传时再 stat（可能因外置盘休眠返回 0）。
         let hash_start = std::time::Instant::now();
         let _hash_permit = ctx2.hash_sem.acquire().await.unwrap();
         tracing::debug!(file = %name, "pre-hash start (hash_sem acquired)");
-        let hash = match Yun139Client::sha256_file(&local).await {
-            Ok(h) => h,
+        let (hash, file_size) = match Yun139Client::sha256_file(&local).await {
+            Ok(r) => r,
             Err(e) => {
                 tracing::error!(file = %name, err = %e, "SHA256 failed, skip upload");
                 ctx2.failed.fetch_add(1, Ordering::Relaxed);
@@ -841,7 +843,7 @@ fn push_upload(ctx: &Arc<SyncCtx>, local: PathBuf, cloud_dir: String) {
         tracing::debug!(file = %name, "waiting for global_sem");
         let _permit = ctx2.global_sem.acquire().await.unwrap();
         tracing::debug!(file = %name, "got global_sem, starting upload");
-        do_upload_task(&ctx2, local, cloud_dir, hash).await;
+        do_upload_task(&ctx2, local, cloud_dir, hash, file_size).await;
     });
 }
 
@@ -860,12 +862,12 @@ fn push_hash_then_upload(ctx: &Arc<SyncCtx>, local: PathBuf, cloud_dir: String, 
         let name = local.file_name().unwrap_or_default().to_string_lossy().to_string();
 
         // Phase 1: 计算本地 SHA256 — 持有 hash_sem，不持有 global_sem
-        // 用 sha256_file（async + 内部 spawn_blocking）以获得正确错误传播
+        // sha256_file 同时返回文件大小，避免后续 stat 因磁盘休眠返回 0
         let hash_start = std::time::Instant::now();
         let _hash_permit = ctx2.hash_sem.acquire().await.unwrap();
         tracing::debug!(file = %name, "hash_check: computing local SHA256 (hash_sem acquired)");
-        let local_hash = match Yun139Client::sha256_file(&local).await {
-            Ok(h) => h,
+        let (local_hash, file_size) = match Yun139Client::sha256_file(&local).await {
+            Ok(r) => r,
             Err(e) => {
                 // 文件读取失败（权限/句柄耗尽等）→ 记录错误，不要用空 hash 当 mismatch
                 tracing::error!(file = %name, err = %e, "hash_check SHA256 failed, skip");
@@ -886,7 +888,7 @@ fn push_hash_then_upload(ctx: &Arc<SyncCtx>, local: PathBuf, cloud_dir: String, 
             // Phase 2: 获取网络上传槽
             let _permit = ctx2.global_sem.acquire().await.unwrap();
             tracing::debug!(file = %name, "got global_sem, starting upload (hash mismatch)");
-            do_upload_task(&ctx2, local, cloud_dir, local_hash).await;
+            do_upload_task(&ctx2, local, cloud_dir, local_hash, file_size).await;
         } else {
             tracing::debug!(file = %name, hash_ms, "hash match → skip ✓");
             ctx2.skipped.fetch_add(1, Ordering::Relaxed);
@@ -904,7 +906,7 @@ fn push_hash_then_download(ctx: &Arc<SyncCtx>, cloud: String, local: PathBuf, es
         let _hash_permit = ctx2.hash_sem.acquire().await.unwrap();
         tracing::debug!(file = %name, "hash_check: computing local SHA256 (hash_sem acquired)");
         let local_hash = match Yun139Client::sha256_file(&local).await {
-            Ok(h) => h,
+            Ok((h, _)) => h,  // 文件大小在下载场景不需要
             Err(e) => {
                 tracing::error!(file = %name, err = %e, "hash_check SHA256 failed, skip");
                 ctx2.failed.fetch_add(1, Ordering::Relaxed);
@@ -936,8 +938,11 @@ fn push_hash_then_download(ctx: &Arc<SyncCtx>, cloud: String, local: PathBuf, es
 
 /// 上传任务主体（调用方须已持有 global_sem）。
 /// `prehashed` 为已在 sem 外预计算好的 SHA256。
-async fn do_upload_task(ctx: &SyncCtx, local: PathBuf, cloud_dir: String, prehashed: String) {
-    let file_size = tokio::fs::metadata(&local).await.map(|m| m.len()).unwrap_or(0);
+/// 实际执行上传（持有 global_sem 期间调用）。
+///
+/// `file_size` 由 sha256_file 在 hash_sem 持有时测量，避免后续 metadata 调用
+/// 因外置盘休眠返回 0 导致 "cannot upload empty file" 误报。
+async fn do_upload_task(ctx: &SyncCtx, local: PathBuf, cloud_dir: String, prehashed: String, file_size: u64) {
     let pb = ctx.mp.insert_before(&ctx.overall_pb, ProgressBar::new(file_size));
     pb.set_style(ctx.task_style.clone());
     let name = local.file_name().unwrap_or_default().to_string_lossy().to_string();

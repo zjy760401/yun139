@@ -24,11 +24,14 @@ const MAX_RETRIES: u32 = 5;
 const SMALL_FILE_THRESHOLD: u64 = 10 * 1024 * 1024;
 
 impl Yun139Client {
-    /// 计算本地文件的 SHA256（hex 小写）。
+    /// 计算本地文件的 SHA256（hex 小写）及文件大小。
+    ///
+    /// 返回 `(hash_hex, file_size_bytes)`。文件大小从实际读取字节数得出，
+    /// 避免单独 stat 调用（且不受磁盘休眠导致后续 stat 返回 0 的影响）。
     ///
     /// **sync 场景应在获取 global_sem 之前调用此函数**，否则磁盘 IO 会
     /// 占用上传并发槽，导致所有文件卡在 0 B/s。
-    pub async fn sha256_file(local_path: &std::path::Path) -> Result<String> {
+    pub async fn sha256_file(local_path: &std::path::Path) -> Result<(String, u64)> {
         compute_sha256(local_path).await
     }
 
@@ -46,7 +49,7 @@ impl Yun139Client {
 
         tracing::debug!(file = %local_path.display(), size = file_size, "upload_file: computing SHA256");
         let t0 = std::time::Instant::now();
-        let content_hash = compute_sha256(local_path).await?;
+        let (content_hash, _) = compute_sha256(local_path).await?;
         tracing::debug!(hash = %content_hash, elapsed_ms = t0.elapsed().as_millis() as u64, "upload_file: SHA256 done");
 
         self.upload_file_prehashed(local_path, file_size, &content_hash, cloud_dir, on_progress).await
@@ -226,23 +229,25 @@ impl Yun139Client {
 
 // ── 内部实现 ──
 
-async fn compute_sha256(path: &std::path::Path) -> Result<String> {
+async fn compute_sha256(path: &std::path::Path) -> Result<(String, u64)> {
     let path = path.to_path_buf();
-    let hash = tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         use digest::Digest;
         let mut file = std::fs::File::open(&path)?;
         let mut hasher = sha2::Sha256::new();
         let mut buf = vec![0u8; 2 * 1024 * 1024];
+        let mut total: u64 = 0;
         loop {
             let n = std::io::Read::read(&mut file, &mut buf)?;
             if n == 0 { break; }
             hasher.update(&buf[..n]);
+            total += n as u64;
         }
-        Ok::<String, std::io::Error>(hex::encode(hasher.finalize()))
+        Ok::<(String, u64), std::io::Error>((hex::encode(hasher.finalize()), total))
     })
     .await
     .map_err(|e| Yun139Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))??;
-    Ok(hash)
+    Ok(result)
 }
 
 async fn fetch_all_upload_urls(
