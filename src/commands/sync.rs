@@ -45,11 +45,19 @@ pub struct SyncOptions {
     pub upload_only: bool,
     /// 仅下载（跳过上传）
     pub download_only: bool,
+    /// 对同名同大小的文件做 SHA256 校验（默认 false）。
+    ///
+    /// 默认行为（false）：同名同大小时用 **mtime 比较**决定是否跳过
+    ///   - local_mtime ≤ cloud_updated_at → skip（本地未改动）
+    ///   - local_mtime > cloud_updated_at → 重新上传（本地比云端新）
+    ///
+    /// `--checksum`（true）：仍走 SHA256 精确对比（慢但绝对准确）。
+    pub checksum: bool,
 }
 
 impl Default for SyncOptions {
     fn default() -> Self {
-        Self { delete: false, concurrency: default_parallel(), upload_only: false, download_only: false }
+        Self { delete: false, concurrency: default_parallel(), upload_only: false, download_only: false, checksum: false }
     }
 }
 
@@ -58,6 +66,7 @@ impl SyncOptions {
     pub fn with_concurrency(mut self, n: usize) -> Self { self.concurrency = n.max(1); self }
     pub fn with_upload_only(mut self, v: bool) -> Self { self.upload_only = v; self }
     pub fn with_download_only(mut self, v: bool) -> Self { self.download_only = v; self }
+    pub fn with_checksum(mut self, v: bool) -> Self { self.checksum = v; self }
 }
 
 /// 单条同步动作（仅用于删除的延迟执行）。
@@ -125,14 +134,24 @@ struct SyncCtx {
     delete: bool,
     upload_only: bool,
     download_only: bool,
+    /// 是否对同名同大小的文件做 SHA256 校验（对应 --checksum flag）
+    checksum: bool,
     cloud_root: String,
     parallel: usize,
     exclude: Vec<String>,
 
     // Worker JoinSet
     join_set: TokioMutex<tokio::task::JoinSet<()>>,
-    // 唯一的并发控制信号量
+
+    // 网络上传/下载并发控制（同时也给 Walker list 短暂使用）
     global_sem: Arc<tokio::sync::Semaphore>,
+
+    // SHA256 计算并发控制（独立于 global_sem，防止外置硬盘 IO 争抢）
+    //
+    // 外置 HDD/SSD 顺序读吞吐远优于随机并发读。限制同时计算 SHA256 的
+    // 文件数量可显著减少 IO 争抢，避免 File::open 因资源耗尽而静默失败。
+    // 推荐值 4（对外置 USB 盘友好，也不让 CPU 闲置）。
+    hash_sem: Arc<tokio::sync::Semaphore>,
 
     // 延迟删除
     pending_deletes: TokioMutex<Vec<SyncAction>>,
@@ -199,11 +218,14 @@ async fn streaming_sync(
         delete: opts.delete,
         upload_only: opts.upload_only,
         download_only: opts.download_only,
+        checksum: opts.checksum,
         cloud_root: ct.clone(),
         parallel: p,
         exclude,
         join_set: TokioMutex::new(tokio::task::JoinSet::new()),
         global_sem: Arc::new(tokio::sync::Semaphore::new(p)),
+        // 外置盘最多 4 个文件同时计算 SHA256；内置盘也不必超过 8
+        hash_sem: Arc::new(tokio::sync::Semaphore::new(p.min(4))),
         pending_deletes: TokioMutex::new(Vec::new()),
         uploaded: Arc::new(AtomicU32::new(0)),
         downloaded: Arc::new(AtomicU32::new(0)),
@@ -449,14 +471,29 @@ async fn walk_local_to_cloud(
                 }
             }
             Some(ci) => {
-                if !ci.content_hash.is_empty() {
+                // 同名同大小：按 checksum 模式决定处理方式
+                if ctx.checksum && !ci.content_hash.is_empty() {
+                    // --checksum 模式：做 SHA256 精确对比
                     to_hash_check.push(HashCheck {
                         local: item.local_dir.join(&le.name),
                         cloud_dir: item.cloud_dir.clone(),
                         cloud_hash: ci.content_hash.clone(),
                     });
                 } else {
-                    skip_count += 1;
+                    // 默认模式（mtime 比较）：
+                    //   本地 mtime > 云端 updated_at → 本地文件比云端新 → 重新上传
+                    //   否则 → 跳过（文件未改动）
+                    let cloud_mtime = parse_cloud_mtime_ms(&ci.updated_at);
+                    if le.mtime_ms > cloud_mtime {
+                        tracing::debug!(file = %le.name, local_mtime = le.mtime_ms, cloud_mtime, "mtime newer → upload");
+                        to_upload.push(FileInfo {
+                            local: item.local_dir.join(&le.name),
+                            cloud_dir: item.cloud_dir.clone(),
+                        });
+                    } else {
+                        tracing::debug!(file = %le.name, "mtime match → skip (no checksum)");
+                        skip_count += 1;
+                    }
                 }
             }
         }
@@ -478,7 +515,7 @@ async fn walk_local_to_cloud(
     }
     ctx.skipped.fetch_add(skip_count, Ordering::Relaxed);
 
-    // 分发 hash 检查任务
+    // 分发 hash 检查任务（只在 --checksum 模式下非空）
     if !ctx.download_only {
         for hc in to_hash_check {
             push_hash_then_upload(ctx, hc.local, hc.cloud_dir, hc.cloud_hash).await;
@@ -586,7 +623,9 @@ async fn walk_cloud_to_local(
                 }
             }
             Some(_le) => {
-                if !ci.content_hash.is_empty() {
+                // 同名同大小：按 checksum 模式决定处理方式
+                if ctx.checksum && !ci.content_hash.is_empty() {
+                    // --checksum 模式：做 SHA256 精确对比
                     to_hash_check.push(HashCheck {
                         cloud: rel_cloud(ct, &item.prefix, &ci.name),
                         local: item.local_dir.join(&ci.name),
@@ -594,7 +633,21 @@ async fn walk_cloud_to_local(
                         cloud_hash: ci.content_hash.clone(),
                     });
                 } else {
-                    skip_count += 1;
+                    // 默认模式（mtime 比较）：
+                    //   云端 updated_at > 本地 mtime → 云端比本地新 → 重新下载
+                    //   否则 → 跳过
+                    let cloud_mtime = parse_cloud_mtime_ms(&ci.updated_at);
+                    if cloud_mtime > _le.mtime_ms {
+                        tracing::debug!(file = %ci.name, cloud_mtime, local_mtime = _le.mtime_ms, "cloud mtime newer → download");
+                        to_download.push(FileInfo {
+                            cloud: rel_cloud(ct, &item.prefix, &ci.name),
+                            local: item.local_dir.join(&ci.name),
+                            size: ci.size as u64,
+                        });
+                    } else {
+                        tracing::debug!(file = %ci.name, "mtime match → skip (no checksum)");
+                        skip_count += 1;
+                    }
                 }
             }
         }
@@ -610,7 +663,7 @@ async fn walk_cloud_to_local(
     }
     ctx.skipped.fetch_add(skip_count, Ordering::Relaxed);
 
-    // 分发 hash 检查任务
+    // 分发 hash 检查任务（只在 --checksum 模式下非空）
     if !ctx.upload_only {
         let parallel = ctx.parallel;
         for hc in to_hash_check {
@@ -663,14 +716,53 @@ async fn walk_cloud_to_local(
 }
 
 // ── Stage 2: Worker 任务分发 ──
+//
+// 并发模型（两个独立信号量）：
+//
+//   hash_sem(min(parallel,4))  — 控制磁盘读取（SHA256）并发
+//     外置 HDD/SSD 顺序吞吐好但并发随机读差。限 4 个文件同时做 SHA256，
+//     避免 IO 争抢导致 File::open 静默失败返回空字符串。
+//
+//   global_sem(parallel)       — 控制网络 IO（上传/下载/list）并发
+//     同时也给 Walker list 短暂使用。
+//
+//   每个 push_upload / push_hash_then_upload 的正确执行顺序：
+//     1. acquire hash_sem  → 计算 SHA256（磁盘 IO）
+//     2. release hash_sem  → 释放磁盘槽
+//     3. acquire global_sem → 执行网络上传
+//     4. release global_sem
 
 async fn push_upload(ctx: &Arc<SyncCtx>, local: PathBuf, cloud_dir: String) {
     let ctx2 = ctx.clone();
     let global = ctx.global_sem.clone();
+    let hash_sem = ctx.hash_sem.clone();
     let mut js = ctx.join_set.lock().await;
     js.spawn(async move {
+        let name = local.file_name().unwrap_or_default().to_string_lossy().to_string();
+
+        // Phase 1: 计算 SHA256 — 持有 hash_sem，不持有 global_sem
+        let hash_start = std::time::Instant::now();
+        let _hash_permit = hash_sem.acquire().await.unwrap();
+        tracing::debug!(file = %name, "pre-hash start (hash_sem acquired)");
+        let hash = match Yun139Client::sha256_file(&local).await {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!(file = %name, err = %e, "SHA256 failed, skip upload");
+                ctx2.failed.fetch_add(1, Ordering::Relaxed);
+                ctx2.failed_files.lock().unwrap().push((format!("↑ {}", local.display()), e.to_string()));
+                ctx2.overall_pb.inc(1);
+                return;
+            }
+        };
+        let hash_ms = hash_start.elapsed().as_millis() as u64;
+        drop(_hash_permit); // 立即释放磁盘槽，后续只需网络槽
+        tracing::debug!(file = %name, hash_ms, "pre-hash done (hash_sem released)");
+
+        // Phase 2: 获取网络上传槽
+        tracing::debug!(file = %name, "waiting for global_sem");
         let _permit = global.acquire().await.unwrap();
-        do_upload_task(&ctx2, local, cloud_dir).await;
+        tracing::debug!(file = %name, "got global_sem, starting upload");
+        do_upload_task(&ctx2, local, cloud_dir, hash).await;
     });
 }
 
@@ -688,22 +780,41 @@ async fn push_download(ctx: &Arc<SyncCtx>, cloud: String, local: PathBuf, est_si
 async fn push_hash_then_upload(ctx: &Arc<SyncCtx>, local: PathBuf, cloud_dir: String, cloud_hash: String) {
     let ctx2 = ctx.clone();
     let global = ctx.global_sem.clone();
+    let hash_sem = ctx.hash_sem.clone();
     let mut js = ctx.join_set.lock().await;
     js.spawn(async move {
-        let _permit = global.acquire().await.unwrap();
-        let hash_start = std::time::Instant::now();
-        let path = local.clone();
-        let local_hash = tokio::task::spawn_blocking(move || compute_sha256_hex(&path))
-            .await.unwrap_or_default();
-        let hash_ms = hash_start.elapsed().as_millis() as u64;
-
         let name = local.file_name().unwrap_or_default().to_string_lossy().to_string();
+
+        // Phase 1: 计算本地 SHA256 — 持有 hash_sem，不持有 global_sem
+        // 用 sha256_file（async + 内部 spawn_blocking）以获得正确错误传播
+        let hash_start = std::time::Instant::now();
+        let _hash_permit = hash_sem.acquire().await.unwrap();
+        tracing::debug!(file = %name, "hash_check: computing local SHA256 (hash_sem acquired)");
+        let local_hash = match Yun139Client::sha256_file(&local).await {
+            Ok(h) => h,
+            Err(e) => {
+                // 文件读取失败（权限/句柄耗尽等）→ 记录错误，不要用空 hash 当 mismatch
+                tracing::error!(file = %name, err = %e, "hash_check SHA256 failed, skip");
+                ctx2.failed.fetch_add(1, Ordering::Relaxed);
+                ctx2.failed_files.lock().unwrap().push((format!("↑ {}", local.display()), format!("sha256 failed: {e}")));
+                ctx2.overall_pb.inc(1);
+                return;
+            }
+        };
+        let hash_ms = hash_start.elapsed().as_millis() as u64;
+        drop(_hash_permit); // 立即释放磁盘槽
+        tracing::debug!(file = %name, hash_ms, local_hash = %local_hash, cloud_hash = %cloud_hash, "hash_check done (hash_sem released)");
+
         if local_hash != cloud_hash {
+            // 哈希不一致 → 需要重新上传
             tracing::debug!(file = %name, hash_ms, "hash mismatch → upload");
             ctx2.overall_pb.inc_length(1);
-            do_upload_task(&ctx2, local, cloud_dir).await;
+            // Phase 2: 获取网络上传槽
+            let _permit = global.acquire().await.unwrap();
+            tracing::debug!(file = %name, "got global_sem, starting upload (hash mismatch)");
+            do_upload_task(&ctx2, local, cloud_dir, local_hash).await;
         } else {
-            tracing::info!(file = %name, hash_ms, "hash match → skip");
+            tracing::debug!(file = %name, hash_ms, "hash match → skip ✓");
             ctx2.skipped.fetch_add(1, Ordering::Relaxed);
         }
     });
@@ -712,22 +823,39 @@ async fn push_hash_then_upload(ctx: &Arc<SyncCtx>, local: PathBuf, cloud_dir: St
 async fn push_hash_then_download(ctx: &Arc<SyncCtx>, cloud: String, local: PathBuf, est_size: u64, cloud_hash: String, parallel: usize) {
     let ctx2 = ctx.clone();
     let global = ctx.global_sem.clone();
+    let hash_sem = ctx.hash_sem.clone();
     let mut js = ctx.join_set.lock().await;
     js.spawn(async move {
-        let _permit = global.acquire().await.unwrap();
-        let hash_start = std::time::Instant::now();
-        let path = local.clone();
-        let local_hash = tokio::task::spawn_blocking(move || compute_sha256_hex(&path))
-            .await.unwrap_or_default();
-        let hash_ms = hash_start.elapsed().as_millis() as u64;
-
         let name = local.file_name().unwrap_or_default().to_string_lossy().to_string();
+
+        // Phase 1: 计算本地 SHA256 — 持有 hash_sem，不持有 global_sem
+        let hash_start = std::time::Instant::now();
+        let _hash_permit = hash_sem.acquire().await.unwrap();
+        tracing::debug!(file = %name, "hash_check: computing local SHA256 (hash_sem acquired)");
+        let local_hash = match Yun139Client::sha256_file(&local).await {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!(file = %name, err = %e, "hash_check SHA256 failed, skip");
+                ctx2.failed.fetch_add(1, Ordering::Relaxed);
+                ctx2.failed_files.lock().unwrap().push((format!("↓ {cloud}"), format!("sha256 failed: {e}")));
+                ctx2.overall_pb.inc(1);
+                return;
+            }
+        };
+        let hash_ms = hash_start.elapsed().as_millis() as u64;
+        drop(_hash_permit);
+        tracing::debug!(file = %name, hash_ms, local_hash = %local_hash, cloud_hash = %cloud_hash, "hash_check done (hash_sem released)");
+
         if local_hash != cloud_hash {
+            // 哈希不一致 → 需要重新下载
             tracing::debug!(file = %name, hash_ms, "hash mismatch → download");
             ctx2.overall_pb.inc_length(1);
+            // Phase 2: 获取网络下载槽
+            let _permit = global.acquire().await.unwrap();
+            tracing::debug!(file = %name, "got global_sem, starting download (hash mismatch)");
             do_download_task(&ctx2, cloud, local, est_size, parallel).await;
         } else {
-            tracing::info!(file = %name, hash_ms, "hash match → skip");
+            tracing::debug!(file = %name, hash_ms, "hash match → skip ✓");
             ctx2.skipped.fetch_add(1, Ordering::Relaxed);
         }
     });
@@ -735,22 +863,27 @@ async fn push_hash_then_download(ctx: &Arc<SyncCtx>, cloud: String, local: PathB
 
 // ── 传输任务实现 ──
 
-async fn do_upload_task(ctx: &SyncCtx, local: PathBuf, cloud_dir: String) {
+/// 上传任务主体（调用方须已持有 global_sem）。
+/// `prehashed` 为已在 sem 外预计算好的 SHA256。
+async fn do_upload_task(ctx: &SyncCtx, local: PathBuf, cloud_dir: String, prehashed: String) {
     let file_size = tokio::fs::metadata(&local).await.map(|m| m.len()).unwrap_or(0);
     let pb = ctx.mp.insert_before(&ctx.overall_pb, ProgressBar::new(file_size));
     pb.set_style(ctx.task_style.clone());
     let name = local.file_name().unwrap_or_default().to_string_lossy().to_string();
     pb.set_prefix(format!("↑ {}", truncate_name(&name, 28)));
 
+    tracing::debug!(file = %name, size = file_size, "do_upload_task: calling upload_file_prehashed");
     let pb2 = pb.clone();
-    match ctx.client.upload_file(&local, &cloud_dir, move |bytes, _| { pb2.set_position(bytes); }).await {
+    match ctx.client.upload_file_prehashed(&local, file_size, &prehashed, &cloud_dir, move |bytes, _| { pb2.set_position(bytes); }).await {
         Ok(_) => {
             pb.set_position(file_size);
             pb.finish_and_clear();
             ctx.uploaded.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(file = %name, "upload done ✓");
         }
         Err(e) => {
             let msg = e.to_string();
+            tracing::warn!(file = %name, err = %msg, "upload failed");
             pb.abandon_with_message(format!("失败: {}", truncate_name(&msg, 40)));
             ctx.failed.fetch_add(1, Ordering::Relaxed);
             ctx.failed_files.lock().unwrap().push((format!("↑ {}", local.display()), msg));
@@ -910,7 +1043,11 @@ fn compute_sha256_hex(path: &Path) -> String {
     use digest::Digest;
     let mut file = match std::fs::File::open(path) {
         Ok(f) => f,
-        Err(_) => return String::new(),
+        Err(e) => {
+            // 记录错误而不是静默返回空字符串（空字符串会被误当成 hash mismatch）
+            tracing::error!(path = %path.display(), err = %e, "compute_sha256_hex: failed to open file");
+            return String::new();
+        }
     };
     let mut hasher = sha2::Sha256::new();
     let mut buf = vec![0u8; 2 * 1024 * 1024];
@@ -918,7 +1055,10 @@ fn compute_sha256_hex(path: &Path) -> String {
         let n = match std::io::Read::read(&mut file, &mut buf) {
             Ok(0) => break,
             Ok(n) => n,
-            Err(_) => return String::new(),
+            Err(e) => {
+                tracing::error!(path = %path.display(), err = %e, "compute_sha256_hex: read error");
+                return String::new();
+            }
         };
         hasher.update(&buf[..n]);
     }

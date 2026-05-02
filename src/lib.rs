@@ -64,7 +64,7 @@ pub async fn upload(
     authorization: &str,
     cloud_dir: &str,
     local_path: &str,
-    on_progress: impl Fn(u64, u64) + Send + Sync,
+    on_progress: impl Fn(u64, u64) + Send + Sync + 'static,
 ) -> Result<String> {
     let client = Yun139Client::new(authorization)?;
     client.upload(local_path, cloud_dir, on_progress).await

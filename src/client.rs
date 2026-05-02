@@ -302,7 +302,7 @@ impl Yun139Client {
         &self,
         local_path: &str,
         cloud_dir: &str,
-        on_progress: impl Fn(u64, u64) + Send + Sync,
+        on_progress: impl Fn(u64, u64) + Send + Sync + 'static,
     ) -> Result<String> {
         self.upload_file(std::path::Path::new(local_path), cloud_dir, on_progress).await
     }
