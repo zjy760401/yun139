@@ -16,7 +16,7 @@
 //!                  Workers 在执行任务时持有。
 //! ```
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -140,18 +140,25 @@ struct SyncCtx {
     parallel: usize,
     exclude: Vec<String>,
 
-    // Worker JoinSet
-    join_set: TokioMutex<tokio::task::JoinSet<()>>,
-
-    // 网络上传/下载并发控制（同时也给 Walker list 短暂使用）
+    // ── 并发控制 ──
+    //
+    // 目录扫描（list API）、文件上传、文件下载共享同一个 global_sem。
+    // 这样遍历器和传输任务自然形成反压：sem 满时新目录扫描排队等待，
+    // 不会无限制地把任务堆积进任务池。
+    //
+    // 任务池：tokio::spawn + active_tasks 计数器，无需 JoinSet。
+    // all_done：最后一个任务完成时 notify，主循环据此退出等待。
     global_sem: Arc<tokio::sync::Semaphore>,
 
     // SHA256 计算并发控制（独立于 global_sem，防止外置硬盘 IO 争抢）
     //
     // 外置 HDD/SSD 顺序读吞吐远优于随机并发读。限制同时计算 SHA256 的
     // 文件数量可显著减少 IO 争抢，避免 File::open 因资源耗尽而静默失败。
-    // 推荐值 4（对外置 USB 盘友好，也不让 CPU 闲置）。
     hash_sem: Arc<tokio::sync::Semaphore>,
+
+    // 活跃任务计数 + 完成通知（替代 JoinSet）
+    active_tasks: Arc<AtomicU32>,
+    all_done: Arc<tokio::sync::Notify>,
 
     // 延迟删除
     pending_deletes: TokioMutex<Vec<SyncAction>>,
@@ -222,10 +229,11 @@ async fn streaming_sync(
         cloud_root: ct.clone(),
         parallel: p,
         exclude,
-        join_set: TokioMutex::new(tokio::task::JoinSet::new()),
         global_sem: Arc::new(tokio::sync::Semaphore::new(p)),
         // 外置盘最多 4 个文件同时计算 SHA256；内置盘也不必超过 8
         hash_sem: Arc::new(tokio::sync::Semaphore::new(p.min(4))),
+        active_tasks: Arc::new(AtomicU32::new(0)),
+        all_done: Arc::new(tokio::sync::Notify::new()),
         pending_deletes: TokioMutex::new(Vec::new()),
         uploaded: Arc::new(AtomicU32::new(0)),
         downloaded: Arc::new(AtomicU32::new(0)),
@@ -239,8 +247,18 @@ async fn streaming_sync(
         task_style,
     });
 
-    // ── Stage 1: Walker（BFS 广度优先遍历） ──
-    bfs_walk(ctx.clone(), local_root.to_path_buf(), ct.clone()).await;
+    // ── 并发任务池：遍历 + 传输共享 global_sem ──
+    // spawn_counted 会在 active_tasks 降到 0 时通过 all_done 通知主协程退出。
+    let ctx2 = ctx.clone();
+    let local_root2 = local_root.to_path_buf();
+    spawn_counted(&ctx, async move {
+        scan_dir(ctx2, local_root2, ct.clone(), String::new(), false).await;
+    });
+
+    // 等待所有目录扫描 + 文件传输任务完成
+    while ctx.active_tasks.load(Ordering::Acquire) > 0 {
+        ctx.all_done.notified().await;
+    }
 
     // ── 扫描完毕 ──
     scan_pb.set_style(ProgressStyle::with_template("  {prefix} {msg}").unwrap());
@@ -252,12 +270,6 @@ async fn streaming_sync(
         ctx.dirs_created.load(Ordering::Relaxed),
         pending_len,
     ));
-
-    // ── drain JoinSet 中剩余 Worker 任务 ──
-    {
-        let mut js = ctx.join_set.lock().await;
-        while js.join_next().await.is_some() {}
-    }
     overall_pb.finish_and_clear();
 
     // ── 串行执行删除 ──
@@ -340,130 +352,144 @@ fn delete_sort_key(a: &SyncAction) -> (bool, &str) {
 
 // ── Stage 1: BFS Walker ──
 
-/// BFS 待扫描目录项
-struct WalkItem {
+// 辅助结构体（定义在模块级别以确保 Future Send 安全性）
+struct UploadFileInfo { local: PathBuf, cloud_dir: String }
+struct UploadHashCheck { local: PathBuf, cloud_dir: String, cloud_hash: String }
+struct UploadDirInfo { name: String, cloud_path: String, is_new: bool }
+struct DownloadFileInfo { cloud: String, local: PathBuf, size: u64 }
+struct DownloadHashCheck { cloud: String, local: PathBuf, size: u64, cloud_hash: String }
+struct DownloadDirInfo { name: String, is_new: bool }
+
+/// 原子地递增 active_tasks，然后 spawn 一个匿名 tokio 任务。
+/// 任务完成时递减计数；当计数降到 0 时通知主协程退出等待。
+///
+/// 这是整个并发调度的核心：目录扫描（scan_dir）和文件传输（上传/下载）
+/// 都通过此函数进入任务池，统一受 global_sem 节流。
+fn spawn_counted(ctx: &Arc<SyncCtx>, fut: impl std::future::Future<Output = ()> + Send + 'static) {
+    // 先递增再 spawn，确保即使任务立即完成，active_tasks 也不会提前降到 0
+    ctx.active_tasks.fetch_add(1, Ordering::AcqRel);
+    let active = ctx.active_tasks.clone();
+    let done = ctx.all_done.clone();
+    tokio::spawn(async move {
+        fut.await;
+        // 若本任务是最后一个，通知主协程
+        if active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            done.notify_one();
+        }
+    });
+}
+
+/// 扫描单个目录（替代原 bfs_walk 的单次迭代）。
+///
+/// 持有 global_sem permit → list 云端 + 读本地 → 释放 permit →
+/// 对比结果 → 子目录通过 spawn_counted 递归（不持有 permit）。
+///
+/// 所有子任务（扫描子目录 + 上传/下载文件）都通过 spawn_counted 分发，
+/// 所以主协程只需等待 active_tasks == 0 即可。
+async fn scan_dir(
+    ctx: Arc<SyncCtx>,
     local_dir: PathBuf,
     cloud_dir: String,
     prefix: String,
-    /// 父目录是新目录 → 跳过云端 list，所有文件直接上传/下载
     local_only: bool,
-}
-
-/// 广度优先遍历目录树。单协程执行，每层目录：
-/// 1. 获取 global_sem permit → list 云端 + 读本地
-/// 2. 释放 permit
-/// 3. 对比结果，分发任务到 JoinSet（mkdir / hash+upload / upload / download）
-/// 4. 子目录加入 BFS 队列
-async fn bfs_walk(ctx: Arc<SyncCtx>, local_root: PathBuf, cloud_root: String) {
-    let mut queue: VecDeque<WalkItem> = VecDeque::new();
-    queue.push_back(WalkItem {
-        local_dir: local_root,
-        cloud_dir: cloud_root,
-        prefix: String::new(),
-        local_only: false,
+) {
+    ctx.scan_pb.set_message(if prefix.is_empty() {
+        "/".to_string()
+    } else {
+        truncate_name(&prefix, 50)
     });
 
-    while let Some(item) = queue.pop_front() {
-        ctx.scan_pb.set_message(if item.prefix.is_empty() {
-            "/".to_string()
-        } else {
-            truncate_name(&item.prefix, 50)
-        });
+    // ── 获取 permit → list ──
+    let list_start = std::time::Instant::now();
+    let _permit = ctx.global_sem.acquire().await.unwrap();
 
-        // ── 获取 permit → list ──
-        let list_start = std::time::Instant::now();
-        let _permit = ctx.global_sem.acquire().await.unwrap();
+    let ld = local_dir.clone();
+    let excl = ctx.exclude.clone();
+    let local_handle = tokio::task::spawn_blocking(move || read_local_dir(&ld, &excl));
 
-        let ld = item.local_dir.clone();
-        let excl = ctx.exclude.clone();
-        let local_handle = tokio::task::spawn_blocking(move || read_local_dir(&ld, &excl));
+    let cloud_items = if local_only {
+        Vec::new()
+    } else {
+        ctx.client.list_all_quiet(&cloud_dir).await.unwrap_or_default()
+    };
 
-        let cloud_items = if item.local_only {
-            Vec::new()
-        } else {
-            ctx.client.list_all_quiet(&item.cloud_dir).await.unwrap_or_default()
-        };
+    let local_entries = local_handle.await.unwrap_or_default();
 
-        let local_entries = local_handle.await.unwrap_or_default();
+    // 释放 permit — list 完成，后续分发不需要持有
+    drop(_permit);
 
-        // 释放 permit — list 完成，后续分发不需要持有
-        drop(_permit);
+    let list_elapsed = list_start.elapsed();
+    tracing::info!(
+        dir = %prefix, local_count = local_entries.len(), cloud_count = cloud_items.len(),
+        list_ms = list_elapsed.as_millis() as u64,
+        "scan_dir listed"
+    );
 
-        let list_elapsed = list_start.elapsed();
-        tracing::info!(
-            dir = %item.prefix, local_count = local_entries.len(), cloud_count = cloud_items.len(),
-            list_ms = list_elapsed.as_millis() as u64,
-            "scan_dir listed"
-        );
+    // ── 对比 + 分发 ──
+    // walk_* 函数接受 owned 参数（而非引用），以便返回 `impl Future + Send + 'static`
+    let ct = ctx.cloud_root.clone();
 
-        // ── 对比 + 分发 ──
-        let local_map: HashMap<&str, &LocalEntry> =
-            local_entries.iter().map(|e| (e.name.as_str(), e)).collect();
-        let cloud_map: HashMap<&str, &ListItem> =
-            cloud_items.iter().map(|e| (e.name.as_str(), e)).collect();
-
-        let ct = &ctx.cloud_root;
-
-        match ctx.direction {
-            SyncDirection::LocalToCloud => {
-                walk_local_to_cloud(
-                    &ctx, &item, ct, &local_entries, &cloud_items,
-                    &local_map, &cloud_map, &mut queue,
-                ).await;
-            }
-            SyncDirection::CloudToLocal => {
-                walk_cloud_to_local(
-                    &ctx, &item, ct, &local_entries, &cloud_items,
-                    &local_map, &cloud_map, &mut queue,
-                ).await;
-            }
+    match ctx.direction {
+        SyncDirection::LocalToCloud => {
+            walk_local_to_cloud(
+                ctx, local_dir, cloud_dir, prefix, ct,
+                local_entries, cloud_items,
+            ).await;
+        }
+        SyncDirection::CloudToLocal => {
+            walk_cloud_to_local(
+                ctx, local_dir, cloud_dir, prefix, ct,
+                local_entries, cloud_items,
+            ).await;
         }
     }
 }
 
 /// LocalToCloud: 对比本地 vs 云端，分发 mkdir / upload / hash+upload
-async fn walk_local_to_cloud(
-    ctx: &Arc<SyncCtx>,
-    item: &WalkItem,
-    ct: &str,
-    local_entries: &[LocalEntry],
-    cloud_items: &[ListItem],
-    local_map: &HashMap<&str, &LocalEntry>,
-    cloud_map: &HashMap<&str, &ListItem>,
-    queue: &mut VecDeque<WalkItem>,
-) {
-    struct FileInfo { local: PathBuf, cloud_dir: String }
-    struct HashCheck { local: PathBuf, cloud_dir: String, cloud_hash: String }
-
-    let mut to_upload: Vec<FileInfo> = Vec::new();
-    let mut to_hash_check: Vec<HashCheck> = Vec::new();
+///
+/// 接受 owned 参数并返回 `impl Future + Send + 'static`（非 `async fn`），
+/// 使编译器能够静态验证 Future 的 Send 性，从而安全地传给 spawn_counted。
+fn walk_local_to_cloud(
+    ctx: Arc<SyncCtx>,
+    local_dir: PathBuf,
+    cloud_dir: String,
+    prefix: String,
+    ct: String,
+    local_entries: Vec<LocalEntry>,
+    cloud_items: Vec<ListItem>,
+) -> impl std::future::Future<Output = ()> + Send + 'static {
+    async move {
+        let local_map: HashMap<&str, &LocalEntry> =
+            local_entries.iter().map(|e| (e.name.as_str(), e)).collect();
+        let cloud_map: HashMap<&str, &ListItem> =
+            cloud_items.iter().map(|e| (e.name.as_str(), e)).collect();
+    let mut to_upload: Vec<UploadFileInfo> = Vec::new();
+    let mut to_hash_check: Vec<UploadHashCheck> = Vec::new();
     let mut skip_count: u32 = 0;
 
-    // 收集需要创建的新目录
-    struct DirInfo { name: String, cloud_path: String, is_new: bool }
-    let mut dirs: Vec<DirInfo> = Vec::new();
+    let mut dirs: Vec<UploadDirInfo> = Vec::new();
 
     for le in local_entries.iter().filter(|e| e.is_dir) {
-        let cloud_path = rel_cloud(ct, &item.prefix, &le.name);
+        let cloud_path = rel_cloud(&ct, &prefix, &le.name);
         let is_new = !cloud_map.contains_key(le.name.as_str());
-        dirs.push(DirInfo { name: le.name.clone(), cloud_path, is_new });
+        dirs.push(UploadDirInfo { name: le.name.clone(), cloud_path, is_new });
     }
 
     // 文件对比
     for le in local_entries.iter().filter(|e| !e.is_dir) {
         match cloud_map.get(le.name.as_str()) {
             None => {
-                to_upload.push(FileInfo {
-                    local: item.local_dir.join(&le.name),
-                    cloud_dir: item.cloud_dir.clone(),
+                to_upload.push(UploadFileInfo {
+                    local: local_dir.join(&le.name),
+                    cloud_dir: cloud_dir.to_string(),
                 });
             }
             Some(ci) if ci.size != le.size as i64 => {
                 let cloud_mtime = parse_cloud_mtime_ms(&ci.updated_at);
                 if le.mtime_ms >= cloud_mtime {
-                    to_upload.push(FileInfo {
-                        local: item.local_dir.join(&le.name),
-                        cloud_dir: item.cloud_dir.clone(),
+                    to_upload.push(UploadFileInfo {
+                        local: local_dir.join(&le.name),
+                        cloud_dir: cloud_dir.to_string(),
                     });
                 } else {
                     tracing::debug!(file = %le.name, "skip: cloud is newer");
@@ -474,9 +500,9 @@ async fn walk_local_to_cloud(
                 // 同名同大小：按 checksum 模式决定处理方式
                 if ctx.checksum && !ci.content_hash.is_empty() {
                     // --checksum 模式：做 SHA256 精确对比
-                    to_hash_check.push(HashCheck {
-                        local: item.local_dir.join(&le.name),
-                        cloud_dir: item.cloud_dir.clone(),
+                    to_hash_check.push(UploadHashCheck {
+                        local: local_dir.join(&le.name),
+                        cloud_dir: cloud_dir.to_string(),
                         cloud_hash: ci.content_hash.clone(),
                     });
                 } else {
@@ -486,9 +512,9 @@ async fn walk_local_to_cloud(
                     let cloud_mtime = parse_cloud_mtime_ms(&ci.updated_at);
                     if le.mtime_ms > cloud_mtime {
                         tracing::debug!(file = %le.name, local_mtime = le.mtime_ms, cloud_mtime, "mtime newer → upload");
-                        to_upload.push(FileInfo {
-                            local: item.local_dir.join(&le.name),
-                            cloud_dir: item.cloud_dir.clone(),
+                        to_upload.push(UploadFileInfo {
+                            local: local_dir.join(&le.name),
+                            cloud_dir: cloud_dir.to_string(),
                         });
                     } else {
                         tracing::debug!(file = %le.name, "mtime match → skip (no checksum)");
@@ -500,7 +526,7 @@ async fn walk_local_to_cloud(
     }
 
     tracing::info!(
-        dir = %item.prefix, to_upload = to_upload.len(), to_hash = to_hash_check.len(),
+        dir = %prefix, to_upload = to_upload.len(), to_hash = to_hash_check.len(),
         skipped = skip_count, sub_dirs = dirs.len(),
         "scan_dir decision"
     );
@@ -518,14 +544,14 @@ async fn walk_local_to_cloud(
     // 分发 hash 检查任务（只在 --checksum 模式下非空）
     if !ctx.download_only {
         for hc in to_hash_check {
-            push_hash_then_upload(ctx, hc.local, hc.cloud_dir, hc.cloud_hash).await;
+            push_hash_then_upload(&ctx, hc.local, hc.cloud_dir, hc.cloud_hash);
         }
     } else {
         ctx.skipped.fetch_add(to_hash_check.len() as u32, Ordering::Relaxed);
     }
 
     // 并行创建新目录
-    let new_dir_paths: Vec<&DirInfo> = dirs.iter().filter(|d| d.is_new).collect();
+    let new_dir_paths: Vec<&UploadDirInfo> = dirs.iter().filter(|d| d.is_new).collect();
     if !new_dir_paths.is_empty() {
         ctx.scan_pb.set_message(format!("📁 creating {} dirs", new_dir_paths.len()));
         let mkdir_futures: Vec<_> = new_dir_paths.iter().map(|d| {
@@ -545,26 +571,28 @@ async fn walk_local_to_cloud(
         }
     }
 
-    // 子目录加入 BFS 队列
+    // 递归扫描子目录（spawn_counted：与上传任务共享 global_sem）
     for d in &dirs {
-        queue.push_back(WalkItem {
-            local_dir: item.local_dir.join(&d.name),
-            cloud_dir: d.cloud_path.clone(),
-            prefix: rel_path(&item.prefix, &d.name),
-            local_only: d.is_new,
+        let child_local = local_dir.join(&d.name);
+        let child_cloud = d.cloud_path.clone();
+        let child_prefix = rel_path(&prefix, &d.name);
+        let is_new = d.is_new;
+        let ctx2 = ctx.clone();
+        spawn_counted(&ctx, async move {
+            scan_dir(ctx2, child_local, child_cloud, child_prefix, is_new).await;
         });
     }
 
     // 分发上传任务
     for f in to_upload {
-        push_upload(ctx, f.local, f.cloud_dir).await;
+        push_upload(&ctx, f.local, f.cloud_dir);
     }
 
     // 收集删除
     if ctx.delete {
-        for ci in cloud_items {
+        for ci in cloud_items.iter() {
             if !local_map.contains_key(ci.name.as_str()) {
-                let cloud = rel_cloud(ct, &item.prefix, &ci.name);
+                let cloud = rel_cloud(&ct, &prefix, &ci.name);
                 if ci.is_folder {
                     collect_cloud_deletes(&ctx.client, &cloud, &ctx.pending_deletes).await;
                 }
@@ -572,49 +600,52 @@ async fn walk_local_to_cloud(
             }
         }
     }
+    } // async move
 }
 
 /// CloudToLocal: 对比云端 vs 本地，分发 mkdir / download / hash+download
-async fn walk_cloud_to_local(
-    ctx: &Arc<SyncCtx>,
-    item: &WalkItem,
-    ct: &str,
-    local_entries: &[LocalEntry],
-    cloud_items: &[ListItem],
-    local_map: &HashMap<&str, &LocalEntry>,
-    cloud_map: &HashMap<&str, &ListItem>,
-    queue: &mut VecDeque<WalkItem>,
-) {
-    struct FileInfo { cloud: String, local: PathBuf, size: u64 }
-    struct HashCheck { cloud: String, local: PathBuf, size: u64, cloud_hash: String }
-
-    let mut to_download: Vec<FileInfo> = Vec::new();
-    let mut to_hash_check: Vec<HashCheck> = Vec::new();
+///
+/// 同 walk_local_to_cloud，接受 owned 参数并返回 `impl Future + Send + 'static`。
+fn walk_cloud_to_local(
+    ctx: Arc<SyncCtx>,
+    local_dir: PathBuf,
+    cloud_dir: String,
+    prefix: String,
+    ct: String,
+    local_entries: Vec<LocalEntry>,
+    cloud_items: Vec<ListItem>,
+) -> impl std::future::Future<Output = ()> + Send + 'static {
+    async move {
+        let local_map: HashMap<&str, &LocalEntry> =
+            local_entries.iter().map(|e| (e.name.as_str(), e)).collect();
+        let cloud_map: HashMap<&str, &ListItem> =
+            cloud_items.iter().map(|e| (e.name.as_str(), e)).collect();
+    let mut to_download: Vec<DownloadFileInfo> = Vec::new();
+    let mut to_hash_check: Vec<DownloadHashCheck> = Vec::new();
     let mut skip_count: u32 = 0;
 
-    struct DirInfo { name: String, is_new: bool }
-    let mut dirs: Vec<DirInfo> = Vec::new();
+    let mut dirs: Vec<DownloadDirInfo> = Vec::new();
 
     for ci in cloud_items.iter().filter(|e| e.is_folder) {
         let is_new = !local_map.contains_key(ci.name.as_str());
-        dirs.push(DirInfo { name: ci.name.clone(), is_new });
+        dirs.push(DownloadDirInfo { name: ci.name.clone(), is_new });
     }
 
     for ci in cloud_items.iter().filter(|e| !e.is_folder) {
         match local_map.get(ci.name.as_str()) {
             None => {
-                to_download.push(FileInfo {
-                    cloud: rel_cloud(ct, &item.prefix, &ci.name),
-                    local: item.local_dir.join(&ci.name),
+                to_download.push(DownloadFileInfo {
+                    cloud: rel_cloud(&ct, &prefix, &ci.name),
+                    local: local_dir.join(&ci.name),
                     size: ci.size as u64,
                 });
             }
             Some(le) if le.size as i64 != ci.size => {
                 let cloud_mtime = parse_cloud_mtime_ms(&ci.updated_at);
                 if cloud_mtime >= le.mtime_ms {
-                    to_download.push(FileInfo {
-                        cloud: rel_cloud(ct, &item.prefix, &ci.name),
-                        local: item.local_dir.join(&ci.name),
+                    to_download.push(DownloadFileInfo {
+                        cloud: rel_cloud(&ct, &prefix, &ci.name),
+                        local: local_dir.join(&ci.name),
                         size: ci.size as u64,
                     });
                 } else {
@@ -626,9 +657,9 @@ async fn walk_cloud_to_local(
                 // 同名同大小：按 checksum 模式决定处理方式
                 if ctx.checksum && !ci.content_hash.is_empty() {
                     // --checksum 模式：做 SHA256 精确对比
-                    to_hash_check.push(HashCheck {
-                        cloud: rel_cloud(ct, &item.prefix, &ci.name),
-                        local: item.local_dir.join(&ci.name),
+                    to_hash_check.push(DownloadHashCheck {
+                        cloud: rel_cloud(&ct, &prefix, &ci.name),
+                        local: local_dir.join(&ci.name),
                         size: ci.size as u64,
                         cloud_hash: ci.content_hash.clone(),
                     });
@@ -639,9 +670,9 @@ async fn walk_cloud_to_local(
                     let cloud_mtime = parse_cloud_mtime_ms(&ci.updated_at);
                     if cloud_mtime > _le.mtime_ms {
                         tracing::debug!(file = %ci.name, cloud_mtime, local_mtime = _le.mtime_ms, "cloud mtime newer → download");
-                        to_download.push(FileInfo {
-                            cloud: rel_cloud(ct, &item.prefix, &ci.name),
-                            local: item.local_dir.join(&ci.name),
+                        to_download.push(DownloadFileInfo {
+                            cloud: rel_cloud(&ct, &prefix, &ci.name),
+                            local: local_dir.join(&ci.name),
                             size: ci.size as u64,
                         });
                     } else {
@@ -667,7 +698,7 @@ async fn walk_cloud_to_local(
     if !ctx.upload_only {
         let parallel = ctx.parallel;
         for hc in to_hash_check {
-            push_hash_then_download(ctx, hc.cloud, hc.local, hc.size, hc.cloud_hash, parallel).await;
+            push_hash_then_download(&ctx, hc.cloud, hc.local, hc.size, hc.cloud_hash, parallel);
         }
     } else {
         ctx.skipped.fetch_add(to_hash_check.len() as u32, Ordering::Relaxed);
@@ -676,7 +707,7 @@ async fn walk_cloud_to_local(
     // 创建本地目录（本地 IO 很快，直接串行即可）
     for d in &dirs {
         if d.is_new {
-            let lp = item.local_dir.join(&d.name);
+            let lp = local_dir.join(&d.name);
             ctx.scan_pb.set_message(format!("📁 {}", lp.display()));
             match tokio::fs::create_dir_all(&lp).await {
                 Ok(_) => { ctx.dirs_created.fetch_add(1, Ordering::Relaxed); }
@@ -688,31 +719,33 @@ async fn walk_cloud_to_local(
         }
     }
 
-    // 子目录加入 BFS 队列
+    // 递归扫描子目录（spawn_counted：与下载任务共享 global_sem）
     for d in &dirs {
-        queue.push_back(WalkItem {
-            local_dir: item.local_dir.join(&d.name),
-            cloud_dir: rel_cloud(ct, &item.prefix, &d.name),
-            prefix: rel_path(&item.prefix, &d.name),
-            local_only: false,
+        let child_local = local_dir.join(&d.name);
+        let child_cloud = rel_cloud(&ct, &prefix, &d.name);
+        let child_prefix = rel_path(&prefix, &d.name);
+        let ctx2 = ctx.clone();
+        spawn_counted(&ctx, async move {
+            scan_dir(ctx2, child_local, child_cloud, child_prefix, false).await;
         });
     }
 
     // 分发下载任务
     for f in to_download {
-        push_download(ctx, f.cloud, f.local, f.size).await;
+        push_download(&ctx, f.cloud, f.local, f.size);
     }
 
     // 收集删除
     if ctx.delete {
-        for le in local_entries {
+        for le in local_entries.iter() {
             if !cloud_map.contains_key(le.name.as_str()) {
                 ctx.pending_deletes.lock().await.push(SyncAction::DeleteLocal {
-                    local: item.local_dir.join(&le.name),
+                    local: local_dir.join(&le.name),
                 });
             }
         }
     }
+    } // async move
 }
 
 // ── Stage 2: Worker 任务分发 ──
@@ -724,7 +757,7 @@ async fn walk_cloud_to_local(
 //     避免 IO 争抢导致 File::open 静默失败返回空字符串。
 //
 //   global_sem(parallel)       — 控制网络 IO（上传/下载/list）并发
-//     同时也给 Walker list 短暂使用。
+//     目录扫描（scan_dir）、文件上传、文件下载都通过此信号量节流。
 //
 //   每个 push_upload / push_hash_then_upload 的正确执行顺序：
 //     1. acquire hash_sem  → 计算 SHA256（磁盘 IO）
@@ -732,17 +765,14 @@ async fn walk_cloud_to_local(
 //     3. acquire global_sem → 执行网络上传
 //     4. release global_sem
 
-async fn push_upload(ctx: &Arc<SyncCtx>, local: PathBuf, cloud_dir: String) {
+fn push_upload(ctx: &Arc<SyncCtx>, local: PathBuf, cloud_dir: String) {
     let ctx2 = ctx.clone();
-    let global = ctx.global_sem.clone();
-    let hash_sem = ctx.hash_sem.clone();
-    let mut js = ctx.join_set.lock().await;
-    js.spawn(async move {
+    spawn_counted(ctx, async move {
         let name = local.file_name().unwrap_or_default().to_string_lossy().to_string();
 
         // Phase 1: 计算 SHA256 — 持有 hash_sem，不持有 global_sem
         let hash_start = std::time::Instant::now();
-        let _hash_permit = hash_sem.acquire().await.unwrap();
+        let _hash_permit = ctx2.hash_sem.acquire().await.unwrap();
         tracing::debug!(file = %name, "pre-hash start (hash_sem acquired)");
         let hash = match Yun139Client::sha256_file(&local).await {
             Ok(h) => h,
@@ -760,35 +790,30 @@ async fn push_upload(ctx: &Arc<SyncCtx>, local: PathBuf, cloud_dir: String) {
 
         // Phase 2: 获取网络上传槽
         tracing::debug!(file = %name, "waiting for global_sem");
-        let _permit = global.acquire().await.unwrap();
+        let _permit = ctx2.global_sem.acquire().await.unwrap();
         tracing::debug!(file = %name, "got global_sem, starting upload");
         do_upload_task(&ctx2, local, cloud_dir, hash).await;
     });
 }
 
-async fn push_download(ctx: &Arc<SyncCtx>, cloud: String, local: PathBuf, est_size: u64) {
+fn push_download(ctx: &Arc<SyncCtx>, cloud: String, local: PathBuf, est_size: u64) {
     let ctx2 = ctx.clone();
-    let global = ctx.global_sem.clone();
     let parallel = ctx.parallel;
-    let mut js = ctx.join_set.lock().await;
-    js.spawn(async move {
-        let _permit = global.acquire().await.unwrap();
+    spawn_counted(ctx, async move {
+        let _permit = ctx2.global_sem.acquire().await.unwrap();
         do_download_task(&ctx2, cloud, local, est_size, parallel).await;
     });
 }
 
-async fn push_hash_then_upload(ctx: &Arc<SyncCtx>, local: PathBuf, cloud_dir: String, cloud_hash: String) {
+fn push_hash_then_upload(ctx: &Arc<SyncCtx>, local: PathBuf, cloud_dir: String, cloud_hash: String) {
     let ctx2 = ctx.clone();
-    let global = ctx.global_sem.clone();
-    let hash_sem = ctx.hash_sem.clone();
-    let mut js = ctx.join_set.lock().await;
-    js.spawn(async move {
+    spawn_counted(ctx, async move {
         let name = local.file_name().unwrap_or_default().to_string_lossy().to_string();
 
         // Phase 1: 计算本地 SHA256 — 持有 hash_sem，不持有 global_sem
         // 用 sha256_file（async + 内部 spawn_blocking）以获得正确错误传播
         let hash_start = std::time::Instant::now();
-        let _hash_permit = hash_sem.acquire().await.unwrap();
+        let _hash_permit = ctx2.hash_sem.acquire().await.unwrap();
         tracing::debug!(file = %name, "hash_check: computing local SHA256 (hash_sem acquired)");
         let local_hash = match Yun139Client::sha256_file(&local).await {
             Ok(h) => h,
@@ -810,7 +835,7 @@ async fn push_hash_then_upload(ctx: &Arc<SyncCtx>, local: PathBuf, cloud_dir: St
             tracing::debug!(file = %name, hash_ms, "hash mismatch → upload");
             ctx2.overall_pb.inc_length(1);
             // Phase 2: 获取网络上传槽
-            let _permit = global.acquire().await.unwrap();
+            let _permit = ctx2.global_sem.acquire().await.unwrap();
             tracing::debug!(file = %name, "got global_sem, starting upload (hash mismatch)");
             do_upload_task(&ctx2, local, cloud_dir, local_hash).await;
         } else {
@@ -820,17 +845,14 @@ async fn push_hash_then_upload(ctx: &Arc<SyncCtx>, local: PathBuf, cloud_dir: St
     });
 }
 
-async fn push_hash_then_download(ctx: &Arc<SyncCtx>, cloud: String, local: PathBuf, est_size: u64, cloud_hash: String, parallel: usize) {
+fn push_hash_then_download(ctx: &Arc<SyncCtx>, cloud: String, local: PathBuf, est_size: u64, cloud_hash: String, parallel: usize) {
     let ctx2 = ctx.clone();
-    let global = ctx.global_sem.clone();
-    let hash_sem = ctx.hash_sem.clone();
-    let mut js = ctx.join_set.lock().await;
-    js.spawn(async move {
+    spawn_counted(ctx, async move {
         let name = local.file_name().unwrap_or_default().to_string_lossy().to_string();
 
         // Phase 1: 计算本地 SHA256 — 持有 hash_sem，不持有 global_sem
         let hash_start = std::time::Instant::now();
-        let _hash_permit = hash_sem.acquire().await.unwrap();
+        let _hash_permit = ctx2.hash_sem.acquire().await.unwrap();
         tracing::debug!(file = %name, "hash_check: computing local SHA256 (hash_sem acquired)");
         let local_hash = match Yun139Client::sha256_file(&local).await {
             Ok(h) => h,
@@ -851,7 +873,7 @@ async fn push_hash_then_download(ctx: &Arc<SyncCtx>, cloud: String, local: PathB
             tracing::debug!(file = %name, hash_ms, "hash mismatch → download");
             ctx2.overall_pb.inc_length(1);
             // Phase 2: 获取网络下载槽
-            let _permit = global.acquire().await.unwrap();
+            let _permit = ctx2.global_sem.acquire().await.unwrap();
             tracing::debug!(file = %name, "got global_sem, starting download (hash mismatch)");
             do_download_task(&ctx2, cloud, local, est_size, parallel).await;
         } else {
