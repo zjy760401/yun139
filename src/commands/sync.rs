@@ -252,7 +252,7 @@ async fn streaming_sync(
     let ctx2 = ctx.clone();
     let local_root2 = local_root.to_path_buf();
     spawn_counted(&ctx, async move {
-        scan_dir(ctx2, local_root2, ct.clone(), String::new(), false).await;
+        scan_dir(ctx2, local_root2, ct.clone(), String::new(), false, None).await;
     });
 
     // 等待所有目录扫描 + 文件传输任务完成
@@ -355,10 +355,12 @@ fn delete_sort_key(a: &SyncAction) -> (bool, &str) {
 // 辅助结构体（定义在模块级别以确保 Future Send 安全性）
 struct UploadFileInfo { local: PathBuf, cloud_dir: String }
 struct UploadHashCheck { local: PathBuf, cloud_dir: String, cloud_hash: String }
-struct UploadDirInfo { name: String, cloud_path: String, is_new: bool }
+/// is_new=true 表示云端不存在，需要先 create_folder；file_id=Some 表示云端已有此目录
+struct UploadDirInfo { name: String, cloud_path: String, is_new: bool, file_id: Option<String> }
 struct DownloadFileInfo { cloud: String, local: PathBuf, size: u64 }
 struct DownloadHashCheck { cloud: String, local: PathBuf, size: u64, cloud_hash: String }
-struct DownloadDirInfo { name: String, is_new: bool }
+/// file_id=Some 表示云端目录 fileId，传递给 child scan_dir 跳过路径解析
+struct DownloadDirInfo { name: String, is_new: bool, file_id: Option<String> }
 
 /// 原子地递增 active_tasks，然后 spawn 一个匿名 tokio 任务。
 /// 任务完成时递减计数；当计数降到 0 时通知主协程退出等待。
@@ -384,6 +386,9 @@ fn spawn_counted(ctx: &Arc<SyncCtx>, fut: impl std::future::Future<Output = ()> 
 /// 持有 global_sem permit → list 云端 + 读本地 → 释放 permit →
 /// 对比结果 → 子目录通过 spawn_counted 递归（不持有 permit）。
 ///
+/// `cloud_file_id`: 当已知此目录的 fileId 时，直接调 `list_all_by_id`，
+/// 跳过 `resolve_parent_id` 的 O(depth) HTTP 调用链；None 时回退到路径解析。
+///
 /// 所有子任务（扫描子目录 + 上传/下载文件）都通过 spawn_counted 分发，
 /// 所以主协程只需等待 active_tasks == 0 即可。
 async fn scan_dir(
@@ -392,6 +397,7 @@ async fn scan_dir(
     cloud_dir: String,
     prefix: String,
     local_only: bool,
+    cloud_file_id: Option<String>,
 ) {
     ctx.scan_pb.set_message(if prefix.is_empty() {
         "/".to_string()
@@ -409,6 +415,10 @@ async fn scan_dir(
 
     let cloud_items = if local_only {
         Vec::new()
+    } else if let Some(ref fid) = cloud_file_id {
+        // 已知 fileId：缓存当前目录路径映射，再直接 list（省去路径解析 HTTP 调用）
+        ctx.client.cache_path_id(cloud_dir.trim_start_matches('/'), fid);
+        ctx.client.list_all_by_id(fid).await.unwrap_or_default()
     } else {
         ctx.client.list_all_quiet(&cloud_dir).await.unwrap_or_default()
     };
@@ -433,7 +443,7 @@ async fn scan_dir(
         SyncDirection::LocalToCloud => {
             walk_local_to_cloud(
                 ctx, local_dir, cloud_dir, prefix, ct,
-                local_entries, cloud_items,
+                local_entries, cloud_items, cloud_file_id,
             ).await;
         }
         SyncDirection::CloudToLocal => {
@@ -447,6 +457,11 @@ async fn scan_dir(
 
 /// LocalToCloud: 对比本地 vs 云端，分发 mkdir / upload / hash+upload
 ///
+/// `parent_file_id`: 当前目录的 fileId（从 scan_dir 传入）。
+/// - 有值时：新建子目录用 `create_folder(parent_id, name)`（1 次 HTTP），
+///   比 `ensure_dir`（O(depth) HTTP）快数倍。
+/// - 子目录 scan_dir 也携带各自的 file_id，避免递归路径解析。
+///
 /// 接受 owned 参数并返回 `impl Future + Send + 'static`（非 `async fn`），
 /// 使编译器能够静态验证 Future 的 Send 性，从而安全地传给 spawn_counted。
 fn walk_local_to_cloud(
@@ -457,6 +472,7 @@ fn walk_local_to_cloud(
     ct: String,
     local_entries: Vec<LocalEntry>,
     cloud_items: Vec<ListItem>,
+    parent_file_id: Option<String>,
 ) -> impl std::future::Future<Output = ()> + Send + 'static {
     async move {
         let local_map: HashMap<&str, &LocalEntry> =
@@ -472,7 +488,9 @@ fn walk_local_to_cloud(
     for le in local_entries.iter().filter(|e| e.is_dir) {
         let cloud_path = rel_cloud(&ct, &prefix, &le.name);
         let is_new = !cloud_map.contains_key(le.name.as_str());
-        dirs.push(UploadDirInfo { name: le.name.clone(), cloud_path, is_new });
+        // 从云端 listing 中携带子目录的 file_id，子 scan_dir 可直接跳过路径解析
+        let file_id = cloud_map.get(le.name.as_str()).map(|ci| ci.file_id.clone());
+        dirs.push(UploadDirInfo { name: le.name.clone(), cloud_path, is_new, file_id });
     }
 
     // 文件对比
@@ -551,18 +569,41 @@ fn walk_local_to_cloud(
     }
 
     // 并行创建新目录
-    let new_dir_paths: Vec<&UploadDirInfo> = dirs.iter().filter(|d| d.is_new).collect();
-    if !new_dir_paths.is_empty() {
-        ctx.scan_pb.set_message(format!("📁 creating {} dirs", new_dir_paths.len()));
-        let mkdir_futures: Vec<_> = new_dir_paths.iter().map(|d| {
+    // 优先路径：parent_file_id 已知时用 create_folder(parent_id, name)（1 次 HTTP）
+    // 回退路径：parent_file_id 未知时用 ensure_dir（O(depth) HTTP，但有缓存）
+    let new_dir_infos: Vec<_> = dirs.iter().filter(|d| d.is_new).map(|d| {
+        (d.name.clone(), d.cloud_path.clone())
+    }).collect();
+    let mut created_ids: HashMap<String, String> = HashMap::new();
+    if !new_dir_infos.is_empty() {
+        ctx.scan_pb.set_message(format!("📁 creating {} dirs", new_dir_infos.len()));
+        let mkdir_futures: Vec<_> = new_dir_infos.iter().map(|(name, path)| {
             let client = ctx.client.clone();
-            let path = d.cloud_path.clone();
-            async move { (client.ensure_dir(&path).await, path) }
+            let path = path.clone();
+            let name = name.clone();
+            let pfid = parent_file_id.clone();
+            async move {
+                let result = if let Some(ref pfid) = pfid {
+                    // 快速路径：直接用已知父目录 file_id 创建（1 次 HTTP）
+                    client.create_folder(pfid, &name).await
+                } else {
+                    // 回退路径：ensure_dir 逐级查找/创建（有缓存后几乎不重复请求）
+                    client.ensure_dir(&path).await
+                };
+                (name, result, path)
+            }
         }).collect();
         let results = futures_util::future::join_all(mkdir_futures).await;
-        for (result, path) in results {
+        for (name, result, path) in results {
             match result {
-                Ok(_) => { ctx.dirs_created.fetch_add(1, Ordering::Relaxed); }
+                Ok(new_fid) => {
+                    ctx.dirs_created.fetch_add(1, Ordering::Relaxed);
+                    // 缓存新目录路径 → file_id，上传任务的 ensure_dir 可命中缓存
+                    if !new_fid.is_empty() {
+                        ctx.client.cache_path_id(path.trim_start_matches('/'), &new_fid);
+                        created_ids.insert(name, new_fid);
+                    }
+                }
                 Err(e) => {
                     tracing::error!(err = %e, dir = %path, "mkdir cloud failed");
                     ctx.failed.fetch_add(1, Ordering::Relaxed);
@@ -577,9 +618,15 @@ fn walk_local_to_cloud(
         let child_cloud = d.cloud_path.clone();
         let child_prefix = rel_path(&prefix, &d.name);
         let is_new = d.is_new;
+        // 传递子目录 file_id：新建目录从 created_ids 取，已有目录从 listing 取
+        let child_fid = if d.is_new {
+            created_ids.get(&d.name).cloned()
+        } else {
+            d.file_id.clone()
+        };
         let ctx2 = ctx.clone();
         spawn_counted(&ctx, async move {
-            scan_dir(ctx2, child_local, child_cloud, child_prefix, is_new).await;
+            scan_dir(ctx2, child_local, child_cloud, child_prefix, is_new, child_fid).await;
         });
     }
 
@@ -609,7 +656,7 @@ fn walk_local_to_cloud(
 fn walk_cloud_to_local(
     ctx: Arc<SyncCtx>,
     local_dir: PathBuf,
-    cloud_dir: String,
+    _cloud_dir: String,
     prefix: String,
     ct: String,
     local_entries: Vec<LocalEntry>,
@@ -628,7 +675,8 @@ fn walk_cloud_to_local(
 
     for ci in cloud_items.iter().filter(|e| e.is_folder) {
         let is_new = !local_map.contains_key(ci.name.as_str());
-        dirs.push(DownloadDirInfo { name: ci.name.clone(), is_new });
+        // 保留云端目录的 file_id，传递给 child scan_dir 跳过路径解析
+        dirs.push(DownloadDirInfo { name: ci.name.clone(), is_new, file_id: Some(ci.file_id.clone()) });
     }
 
     for ci in cloud_items.iter().filter(|e| !e.is_folder) {
@@ -724,9 +772,10 @@ fn walk_cloud_to_local(
         let child_local = local_dir.join(&d.name);
         let child_cloud = rel_cloud(&ct, &prefix, &d.name);
         let child_prefix = rel_path(&prefix, &d.name);
+        let child_fid = d.file_id.clone();
         let ctx2 = ctx.clone();
         spawn_counted(&ctx, async move {
-            scan_dir(ctx2, child_local, child_cloud, child_prefix, false).await;
+            scan_dir(ctx2, child_local, child_cloud, child_prefix, false, child_fid).await;
         });
     }
 

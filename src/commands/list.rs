@@ -128,6 +128,47 @@ impl Yun139Client {
     }
 }
 
+impl Yun139Client {
+    /// 通过已知 `file_id` 直接列出目录内容（全部遍历，不分页）。
+    ///
+    /// 与 [`list_all`] 的区别：跳过路径解析 (`resolve_parent_id`)，
+    /// 直接用 `file_id` 请求 `/file/list`，减少 O(depth) 次 HTTP 调用。
+    ///
+    /// scan_dir 在持有 cloud_file_id 时调用此方法代替 `list_all`。
+    pub async fn list_all_by_id(&self, file_id: &str) -> Result<Vec<ListItem>> {
+        let mut all_items = Vec::new();
+        let mut cursor = String::new();
+
+        loop {
+            let resp = self.list_files(file_id, &cursor).await?;
+
+            let data = match resp.data {
+                Some(d) => d,
+                None => break,
+            };
+
+            for item in &data.items {
+                all_items.push(ListItem {
+                    file_id: item.file_id.clone().unwrap_or_default(),
+                    name: item.name.clone().unwrap_or_default(),
+                    size: item.size.unwrap_or(0),
+                    is_folder: item.file_type.as_deref() == Some("folder"),
+                    updated_at: item.updated_at.clone().unwrap_or_default(),
+                    content_hash: item.content_hash.clone().unwrap_or_default(),
+                });
+            }
+
+            match data.next_page_cursor {
+                Some(ref c) if !c.is_empty() => cursor = c.clone(),
+                _ => break,
+            }
+        }
+
+        tracing::debug!(file_id = %file_id, count = all_items.len(), "listed by id");
+        Ok(all_items)
+    }
+}
+
 // ── 内部辅助 ──
 
 impl Yun139Client {

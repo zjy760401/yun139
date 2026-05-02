@@ -3,6 +3,9 @@
 //! 核心结构体和基础 API（路由发现、文件列表、路径解析、目录操作）。
 //! 下载/上传的具体实现在 [`crate::commands`] 模块中，以 `impl Yun139Client` 扩展。
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use reqwest::Client;
 use tokio::sync::OnceCell;
 
@@ -25,6 +28,12 @@ pub struct Yun139Client {
     account: String,
     /// 已解析的个人云主机地址，如 `https://personal-kd-njs.yun.139.com/hcy`
     personal_host: OnceCell<String>,
+    /// 路径 → fileId 缓存（不含前缀 "/"，用 "/" 分隔）。
+    ///
+    /// 避免 resolve_path / ensure_dir 对相同路径前缀重复发出 HTTP 请求。
+    /// scan_dir 在获得目录 file_id 后调用 [`Self::cache_path_id`] 写入；
+    /// 上传任务的 ensure_dir 命中缓存后可直接返回，无需任何 HTTP 调用。
+    path_id_cache: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl Yun139Client {
@@ -58,6 +67,7 @@ impl Yun139Client {
             authorization: b64,
             account,
             personal_host: OnceCell::new(),
+            path_id_cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -137,7 +147,20 @@ impl Yun139Client {
 
     // ── 路径解析 ──
 
+    /// 将 cloud 路径（不含前缀 "/"）与 fileId 的映射写入缓存。
+    ///
+    /// scan_dir 在获得目录 file_id 后调用此方法，后续 ensure_dir/resolve_path
+    /// 可命中缓存，无需重复发出 HTTP 请求。
+    pub(crate) fn cache_path_id(&self, path: &str, file_id: &str) {
+        let key = path.trim_start_matches('/').to_string();
+        if !key.is_empty() && !file_id.is_empty() {
+            self.path_id_cache.lock().unwrap().insert(key, file_id.to_string());
+        }
+    }
+
     /// 将 `/test/test.mp4` 解析为 fileId。
+    ///
+    /// 使用路径缓存：已解析过的路径前缀不再发出 HTTP 请求。
     pub async fn resolve_path(&self, cloud_path: &str) -> Result<FileItem> {
         let parts: Vec<&str> = cloud_path
             .trim_start_matches('/')
@@ -150,14 +173,41 @@ impl Yun139Client {
         }
 
         let mut parent_id = "/".to_string();
+        let mut path_so_far = String::new();
 
         for (i, name) in parts.iter().enumerate() {
             let is_last = i == parts.len() - 1;
+
+            if !path_so_far.is_empty() { path_so_far.push('/'); }
+            path_so_far.push_str(name);
+
+            // 先查缓存
+            let cached = self.path_id_cache.lock().unwrap().get(&path_so_far).cloned();
+            if let Some(cached_id) = cached {
+                if is_last {
+                    // 从缓存构造 FileItem（resolve_parent_id 只需 file_id + type）
+                    return Ok(FileItem {
+                        file_id: Some(cached_id),
+                        file_type: Some("folder".to_string()),
+                        name: Some(name.to_string()),
+                        size: None,
+                        updated_at: None,
+                        content_hash: None,
+                    });
+                }
+                parent_id = cached_id;
+                continue;
+            }
+
             let item = self.find_in_dir(&parent_id, name).await?
                 .ok_or_else(|| {
                     let partial: String = parts[..=i].join("/");
                     Yun139Error::PathNotFound(format!("/{partial}"))
                 })?;
+
+            // 写入缓存（包括最后一个节点）
+            let new_id = item.file_id.clone().unwrap_or_default();
+            self.path_id_cache.lock().unwrap().insert(path_so_far.clone(), new_id.clone());
 
             if is_last {
                 return Ok(item);
@@ -168,7 +218,7 @@ impl Yun139Client {
                 return Err(Yun139Error::PathNotFound(format!("/{partial} is not a folder")));
             }
 
-            parent_id = item.file_id.clone().unwrap_or_default();
+            parent_id = new_id;
         }
 
         unreachable!()
@@ -234,7 +284,7 @@ impl Yun139Client {
 
     /// 确保云盘路径存在（类似 `mkdir -p`），返回最终目录的 fileId。
     ///
-    /// 逐级检查并创建不存在的目录。
+    /// 逐级检查并创建不存在的目录。命中路径缓存时无需任何 HTTP 请求。
     pub async fn ensure_dir(&self, cloud_dir: &str) -> Result<String> {
         if cloud_dir.is_empty() || cloud_dir == "/" {
             return Ok("/".to_string());
@@ -246,12 +296,30 @@ impl Yun139Client {
             .filter(|s| !s.is_empty())
             .collect();
 
+        // 先检查完整路径是否已缓存（scan_dir 在扫描目录后写入）
+        let full_key = parts.join("/");
+        if let Some(cached) = self.path_id_cache.lock().unwrap().get(&full_key).cloned() {
+            return Ok(cached);
+        }
+
         let mut parent_id = "/".to_string();
+        let mut path_so_far = String::new();
 
         for name in &parts {
+            if !path_so_far.is_empty() { path_so_far.push('/'); }
+            path_so_far.push_str(name);
+
+            // 检查前缀缓存
+            if let Some(cached) = self.path_id_cache.lock().unwrap().get(&path_so_far).cloned() {
+                parent_id = cached;
+                continue;
+            }
+
             match self.find_in_dir(&parent_id, name).await? {
                 Some(item) if item.file_type.as_deref() == Some("folder") => {
-                    parent_id = item.file_id.unwrap_or_default();
+                    let new_id = item.file_id.unwrap_or_default();
+                    self.path_id_cache.lock().unwrap().insert(path_so_far.clone(), new_id.clone());
+                    parent_id = new_id;
                 }
                 Some(_) => {
                     return Err(Yun139Error::PathNotFound(
@@ -260,7 +328,9 @@ impl Yun139Client {
                 }
                 None => {
                     tracing::info!(parent = %parent_id, name = %name, "creating folder");
-                    parent_id = self.create_folder(&parent_id, name).await?;
+                    let new_id = self.create_folder(&parent_id, name).await?;
+                    self.path_id_cache.lock().unwrap().insert(path_so_far.clone(), new_id.clone());
+                    parent_id = new_id;
                 }
             }
         }
