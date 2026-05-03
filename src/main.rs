@@ -100,6 +100,12 @@ enum Commands {
         /// 对同名同大小的文件做 SHA256 内容校验（默认用 mtime 比较，更快）
         #[arg(long)]
         checksum: bool,
+        /// 以本地为准：无条件用本地覆盖云端，并删除云端多余文件
+        #[arg(long, conflicts_with_all = ["force_remote", "download_only"])]
+        force_local: bool,
+        /// 以云端为准：无条件用云端覆盖本地，并删除本地多余文件
+        #[arg(long, conflicts_with_all = ["force_local", "upload_only"])]
+        force_remote: bool,
     },
 
     /// 搜索云盘文件
@@ -210,8 +216,8 @@ async fn main() {
         Commands::Delete { cloud_path, permanent } =>
             do_delete(&client, &cloud_path, permanent).await,
 
-        Commands::Sync { src, dest, delete, upload_only, download_only, checksum } =>
-            do_sync(&client, &src, &dest, delete, upload_only, download_only, checksum, parallel).await,
+        Commands::Sync { src, dest, delete, upload_only, download_only, checksum, force_local, force_remote } =>
+            do_sync(&client, &src, &dest, delete, upload_only, download_only, checksum, force_local, force_remote, parallel).await,
 
         Commands::Search { keyword, limit } =>
             do_search(&client, &keyword, limit).await,
@@ -646,7 +652,7 @@ async fn do_delete(client: &yun139::Yun139Client, cloud_path: &str, permanent: b
 // ── sync ──
 
 #[allow(clippy::too_many_arguments)]
-async fn do_sync(client: &yun139::Yun139Client, src: &str, dest: &str, delete: bool, upload_only: bool, download_only: bool, checksum: bool, parallel: usize) {
+async fn do_sync(client: &yun139::Yun139Client, src: &str, dest: &str, delete: bool, upload_only: bool, download_only: bool, checksum: bool, force_local: bool, force_remote: bool, parallel: usize) {
     let src_is_cloud = src.starts_with("cloud:");
     let dest_is_cloud = dest.starts_with("cloud:");
     let opts = yun139::SyncOptions::default()
@@ -654,19 +660,23 @@ async fn do_sync(client: &yun139::Yun139Client, src: &str, dest: &str, delete: b
         .with_concurrency(parallel)
         .with_upload_only(upload_only)
         .with_download_only(download_only)
-        .with_checksum(checksum);
+        .with_checksum(checksum)
+        .with_force_local(force_local)
+        .with_force_remote(force_remote);
 
     let result = match (src_is_cloud, dest_is_cloud) {
         (false, true) => {
             let local = std::path::Path::new(src);
             let cloud = dest.strip_prefix("cloud:").unwrap_or(dest);
-            eprintln!("🔄 同步 本地:{src} → 云盘:{cloud} (并发={parallel})");
+            let mode = if force_local { " [强制以本地为准]" } else { "" };
+            eprintln!("🔄 同步 本地:{src} → 云盘:{cloud} (并发={parallel}){mode}");
             client.sync_to_cloud_with_options(local, cloud, &opts, |_| {}).await
         }
         (true, false) => {
             let cloud = src.strip_prefix("cloud:").unwrap_or(src);
             let local = std::path::Path::new(dest);
-            eprintln!("🔄 同步 云盘:{cloud} → 本地:{dest} (并发={parallel})");
+            let mode = if force_remote { " [强制以云端为准]" } else { "" };
+            eprintln!("🔄 同步 云盘:{cloud} → 本地:{dest} (并发={parallel}){mode}");
             client.sync_to_local_with_options(cloud, local, &opts, |_| {}).await
         }
         _ => {

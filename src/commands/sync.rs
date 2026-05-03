@@ -53,11 +53,19 @@ pub struct SyncOptions {
     ///
     /// `--checksum`（true）：仍走 SHA256 精确对比（慢但绝对准确）。
     pub checksum: bool,
+    /// 以本地为准：覆盖所有云端文件，删除云端多余文件（隐含 delete=true）
+    pub force_local: bool,
+    /// 以云端为准：覆盖所有本地文件，删除本地多余文件（隐含 delete=true）
+    pub force_remote: bool,
 }
 
 impl Default for SyncOptions {
     fn default() -> Self {
-        Self { delete: false, concurrency: default_parallel(), upload_only: false, download_only: false, checksum: false }
+        Self {
+            delete: false, concurrency: default_parallel(),
+            upload_only: false, download_only: false, checksum: false,
+            force_local: false, force_remote: false,
+        }
     }
 }
 
@@ -67,6 +75,8 @@ impl SyncOptions {
     pub fn with_upload_only(mut self, v: bool) -> Self { self.upload_only = v; self }
     pub fn with_download_only(mut self, v: bool) -> Self { self.download_only = v; self }
     pub fn with_checksum(mut self, v: bool) -> Self { self.checksum = v; self }
+    pub fn with_force_local(mut self, v: bool) -> Self { self.force_local = v; self }
+    pub fn with_force_remote(mut self, v: bool) -> Self { self.force_remote = v; self }
 }
 
 /// 单条同步动作（仅用于删除的延迟执行）。
@@ -136,6 +146,10 @@ struct SyncCtx {
     download_only: bool,
     /// 是否对同名同大小的文件做 SHA256 校验（对应 --checksum flag）
     checksum: bool,
+    /// 以本地为准：无条件覆盖云端，删除云端多余文件
+    force_local: bool,
+    /// 以云端为准：无条件覆盖本地，删除本地多余文件
+    force_remote: bool,
     cloud_root: String,
     parallel: usize,
     exclude: Vec<String>,
@@ -222,10 +236,12 @@ async fn streaming_sync(
     let ctx = Arc::new(SyncCtx {
         client: client.clone(),
         direction,
-        delete: opts.delete,
+        delete: opts.delete || opts.force_local || opts.force_remote,
         upload_only: opts.upload_only,
         download_only: opts.download_only,
         checksum: opts.checksum,
+        force_local: opts.force_local,
+        force_remote: opts.force_remote,
         cloud_root: ct.clone(),
         parallel: p,
         exclude,
@@ -505,7 +521,7 @@ fn walk_local_to_cloud(
             }
             Some(ci) if ci.size != le.size as i64 => {
                 let cloud_mtime = parse_cloud_mtime_ms(&ci.updated_at);
-                if le.mtime_ms >= cloud_mtime {
+                if ctx.force_local || le.mtime_ms >= cloud_mtime {
                     to_upload.push(UploadFileInfo {
                         local: local_dir.join(&le.name),
                         cloud_dir: cloud_dir.to_string(),
@@ -516,8 +532,13 @@ fn walk_local_to_cloud(
                 }
             }
             Some(ci) => {
-                // 同名同大小：按 checksum 模式决定处理方式
-                if ctx.checksum && !ci.content_hash.is_empty() {
+                if ctx.force_local {
+                    // --force-local：无条件以本地覆盖云端
+                    to_upload.push(UploadFileInfo {
+                        local: local_dir.join(&le.name),
+                        cloud_dir: cloud_dir.to_string(),
+                    });
+                } else if ctx.checksum && !ci.content_hash.is_empty() {
                     // --checksum 模式：做 SHA256 精确对比
                     to_hash_check.push(UploadHashCheck {
                         local: local_dir.join(&le.name),
@@ -692,7 +713,7 @@ fn walk_cloud_to_local(
             }
             Some(le) if le.size as i64 != ci.size => {
                 let cloud_mtime = parse_cloud_mtime_ms(&ci.updated_at);
-                if cloud_mtime >= le.mtime_ms {
+                if ctx.force_remote || cloud_mtime >= le.mtime_ms {
                     to_download.push(DownloadFileInfo {
                         cloud: rel_cloud(&ct, &prefix, &ci.name),
                         local: local_dir.join(&ci.name),
@@ -704,8 +725,14 @@ fn walk_cloud_to_local(
                 }
             }
             Some(_le) => {
-                // 同名同大小：按 checksum 模式决定处理方式
-                if ctx.checksum && !ci.content_hash.is_empty() {
+                if ctx.force_remote {
+                    // --force-remote：无条件以云端覆盖本地
+                    to_download.push(DownloadFileInfo {
+                        cloud: rel_cloud(&ct, &prefix, &ci.name),
+                        local: local_dir.join(&ci.name),
+                        size: ci.size as u64,
+                    });
+                } else if ctx.checksum && !ci.content_hash.is_empty() {
                     // --checksum 模式：做 SHA256 精确对比
                     to_hash_check.push(DownloadHashCheck {
                         cloud: rel_cloud(&ct, &prefix, &ci.name),
