@@ -532,24 +532,29 @@ fn walk_local_to_cloud(
                 }
             }
             Some(ci) => {
+                // 同名同大小，用 mtime 决定是否跳过（force-local 也走此逻辑，不用 SHA256）
+                let cloud_mtime = parse_cloud_mtime_ms(&ci.updated_at);
                 if ctx.force_local {
-                    // --force-local：无条件以本地覆盖云端
-                    to_upload.push(UploadFileInfo {
-                        local: local_dir.join(&le.name),
-                        cloud_dir: cloud_dir.to_string(),
-                    });
+                    // force-local：mtime 也相同则跳过，否则覆盖上传
+                    if le.mtime_ms == cloud_mtime {
+                        tracing::debug!(file = %le.name, "force-local: size+mtime match → skip");
+                        skip_count += 1;
+                    } else {
+                        tracing::debug!(file = %le.name, "force-local: mtime diff → upload");
+                        to_upload.push(UploadFileInfo {
+                            local: local_dir.join(&le.name),
+                            cloud_dir: cloud_dir.to_string(),
+                        });
+                    }
                 } else if ctx.checksum && !ci.content_hash.is_empty() {
-                    // --checksum 模式：做 SHA256 精确对比
+                    // --checksum 模式：SHA256 精确对比
                     to_hash_check.push(UploadHashCheck {
                         local: local_dir.join(&le.name),
                         cloud_dir: cloud_dir.to_string(),
                         cloud_hash: ci.content_hash.clone(),
                     });
                 } else {
-                    // 默认模式（mtime 比较）：
-                    //   本地 mtime > 云端 updated_at → 本地文件比云端新 → 重新上传
-                    //   否则 → 跳过（文件未改动）
-                    let cloud_mtime = parse_cloud_mtime_ms(&ci.updated_at);
+                    // 默认模式（mtime 比较）
                     if le.mtime_ms > cloud_mtime {
                         tracing::debug!(file = %le.name, local_mtime = le.mtime_ms, cloud_mtime, "mtime newer → upload");
                         to_upload.push(UploadFileInfo {
@@ -557,7 +562,7 @@ fn walk_local_to_cloud(
                             cloud_dir: cloud_dir.to_string(),
                         });
                     } else {
-                        tracing::debug!(file = %le.name, "mtime match → skip (no checksum)");
+                        tracing::debug!(file = %le.name, "mtime match → skip");
                         skip_count += 1;
                     }
                 }
@@ -725,15 +730,23 @@ fn walk_cloud_to_local(
                 }
             }
             Some(_le) => {
+                // 同名同大小，用 mtime 决定是否跳过（force-remote 也走此逻辑，不用 SHA256）
+                let cloud_mtime = parse_cloud_mtime_ms(&ci.updated_at);
                 if ctx.force_remote {
-                    // --force-remote：无条件以云端覆盖本地
-                    to_download.push(DownloadFileInfo {
-                        cloud: rel_cloud(&ct, &prefix, &ci.name),
-                        local: local_dir.join(&ci.name),
-                        size: ci.size as u64,
-                    });
+                    // force-remote：mtime 也相同则跳过，否则覆盖下载
+                    if cloud_mtime == _le.mtime_ms {
+                        tracing::debug!(file = %ci.name, "force-remote: size+mtime match → skip");
+                        skip_count += 1;
+                    } else {
+                        tracing::debug!(file = %ci.name, "force-remote: mtime diff → download");
+                        to_download.push(DownloadFileInfo {
+                            cloud: rel_cloud(&ct, &prefix, &ci.name),
+                            local: local_dir.join(&ci.name),
+                            size: ci.size as u64,
+                        });
+                    }
                 } else if ctx.checksum && !ci.content_hash.is_empty() {
-                    // --checksum 模式：做 SHA256 精确对比
+                    // --checksum 模式：SHA256 精确对比
                     to_hash_check.push(DownloadHashCheck {
                         cloud: rel_cloud(&ct, &prefix, &ci.name),
                         local: local_dir.join(&ci.name),
@@ -741,10 +754,7 @@ fn walk_cloud_to_local(
                         cloud_hash: ci.content_hash.clone(),
                     });
                 } else {
-                    // 默认模式（mtime 比较）：
-                    //   云端 updated_at > 本地 mtime → 云端比本地新 → 重新下载
-                    //   否则 → 跳过
-                    let cloud_mtime = parse_cloud_mtime_ms(&ci.updated_at);
+                    // 默认模式（mtime 比较）
                     if cloud_mtime > _le.mtime_ms {
                         tracing::debug!(file = %ci.name, cloud_mtime, local_mtime = _le.mtime_ms, "cloud mtime newer → download");
                         to_download.push(DownloadFileInfo {
@@ -753,7 +763,7 @@ fn walk_cloud_to_local(
                             size: ci.size as u64,
                         });
                     } else {
-                        tracing::debug!(file = %ci.name, "mtime match → skip (no checksum)");
+                        tracing::debug!(file = %ci.name, "mtime match → skip");
                         skip_count += 1;
                     }
                 }
