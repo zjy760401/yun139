@@ -14,13 +14,13 @@ cargo build --release
 从浏览器开发者工具（F12 → Network → 任意 API 请求）复制 `Authorization` 头值：
 
 ```bash
-yun139 config token "Basic REDACTED..."
+yun139 config token "Basic <YOUR_TOKEN>"
 ```
 
 或使用环境变量（优先级高于配置文件）：
 
 ```bash
-export YUN139_AUTH="Basic REDACTED..."
+export YUN139_AUTH="Basic <YOUR_TOKEN>"
 ```
 
 ### 3. 验证

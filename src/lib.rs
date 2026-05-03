@@ -10,7 +10,7 @@
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     let client = Yun139Client::new("Basic REDACTED...").unwrap();
+//!     let client = Yun139Client::new("Basic <YOUR_TOKEN>").unwrap();
 //!
 //!     // 同一个 client 可在多个 tokio::spawn 中并发使用
 //!     let c1 = client.clone();

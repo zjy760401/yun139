@@ -7,7 +7,7 @@ use yun139::Yun139Client;
 
 #[tokio::main]
 async fn main() -> yun139::Result<()> {
-    let client = Yun139Client::new("Basic REDACTED...")?;
+    let client = Yun139Client::new("Basic <YOUR_TOKEN>")?;
 
     // 列出根目录
     let items = client.list_all("/").await?;
