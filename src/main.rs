@@ -668,6 +668,10 @@ async fn do_sync(client: &yun139::Yun139Client, src: &str, dest: &str, delete: b
         (false, true) => {
             let local = std::path::Path::new(src);
             let cloud = dest.strip_prefix("cloud:").unwrap_or(dest);
+            if force_remote {
+                eprintln!("❌ --force-remote 不能用于本地→云盘方向，请改用 --force-local");
+                std::process::exit(1);
+            }
             let mode = if force_local { " [强制以本地为准]" } else { "" };
             eprintln!("🔄 同步 本地:{src} → 云盘:{cloud} (并发={parallel}){mode}");
             client.sync_to_cloud_with_options(local, cloud, &opts, |_| {}).await
@@ -675,6 +679,10 @@ async fn do_sync(client: &yun139::Yun139Client, src: &str, dest: &str, delete: b
         (true, false) => {
             let cloud = src.strip_prefix("cloud:").unwrap_or(src);
             let local = std::path::Path::new(dest);
+            if force_local {
+                eprintln!("❌ --force-local 不能用于云盘→本地方向，请改用 --force-remote");
+                std::process::exit(1);
+            }
             let mode = if force_remote { " [强制以云端为准]" } else { "" };
             eprintln!("🔄 同步 云盘:{cloud} → 本地:{dest} (并发={parallel}){mode}");
             client.sync_to_local_with_options(cloud, local, &opts, |_| {}).await

@@ -1135,22 +1135,21 @@ pub(crate) fn decide_upload(
     force_local: bool,
     checksum: bool,
 ) -> UploadDecision {
+    // --force-local：无条件用本地覆盖云端，不做任何跳过
+    if force_local {
+        return UploadDecision::Upload;
+    }
+
     if local_size as i64 != cloud_size {
-        // 大小不同
-        if force_local || local_mtime_ms >= cloud_mtime_ms {
+        // 大小不同：本地 mtime >= 云端则上传，否则云端更新跳过
+        if local_mtime_ms >= cloud_mtime_ms {
             UploadDecision::Upload
         } else {
             UploadDecision::Skip
         }
     } else {
         // 同名同大小
-        if force_local {
-            if local_mtime_ms == cloud_mtime_ms {
-                UploadDecision::Skip
-            } else {
-                UploadDecision::Upload
-            }
-        } else if checksum && !cloud_hash.is_empty() {
+        if checksum && !cloud_hash.is_empty() {
             UploadDecision::HashCheck { cloud_hash: cloud_hash.to_string() }
         } else if local_mtime_ms > cloud_mtime_ms {
             UploadDecision::Upload
@@ -1170,22 +1169,21 @@ pub(crate) fn decide_download(
     force_remote: bool,
     checksum: bool,
 ) -> DownloadDecision {
+    // --force-remote：无条件用云端覆盖本地，不做任何跳过
+    if force_remote {
+        return DownloadDecision::Download;
+    }
+
     if local_size as i64 != cloud_size {
-        // 大小不同
-        if force_remote || cloud_mtime_ms >= local_mtime_ms {
+        // 大小不同：云端 mtime >= 本地则下载，否则本地更新跳过
+        if cloud_mtime_ms >= local_mtime_ms {
             DownloadDecision::Download
         } else {
             DownloadDecision::Skip
         }
     } else {
         // 同名同大小
-        if force_remote {
-            if cloud_mtime_ms == local_mtime_ms {
-                DownloadDecision::Skip
-            } else {
-                DownloadDecision::Download
-            }
-        } else if checksum && !cloud_hash.is_empty() {
+        if checksum && !cloud_hash.is_empty() {
             DownloadDecision::HashCheck { cloud_hash: cloud_hash.to_string() }
         } else if cloud_mtime_ms > local_mtime_ms {
             DownloadDecision::Download
@@ -1266,12 +1264,13 @@ mod tests {
         assert_eq!(r, UploadDecision::Upload);
     }
 
-    // ── force-local 大小相同 ──
+    // ── force-local：无条件上传，不管 size/mtime ──
 
     #[test]
-    fn upload_force_local_same_size_same_mtime_skips() {
+    fn upload_force_local_same_size_same_mtime_still_uploads() {
+        // force-local：即使 size+mtime 完全相同也要覆盖上传
         let r = decide_upload(100, 1000, 100, 1000, HASH, true, false);
-        assert_eq!(r, UploadDecision::Skip);
+        assert_eq!(r, UploadDecision::Upload);
     }
 
     #[test]
@@ -1284,6 +1283,12 @@ mod tests {
     fn upload_force_local_same_size_cloud_newer_mtime_still_uploads() {
         // force-local：云端 mtime 更新也要覆盖
         let r = decide_upload(100, 1000, 100, 2000, HASH, true, false);
+        assert_eq!(r, UploadDecision::Upload);
+    }
+
+    #[test]
+    fn upload_force_local_size_diff_uploads() {
+        let r = decide_upload(200, 1000, 100, 2000, NO_HASH, true, false);
         assert_eq!(r, UploadDecision::Upload);
     }
 
@@ -1348,12 +1353,13 @@ mod tests {
         assert_eq!(r, DownloadDecision::Download);
     }
 
-    // ── force-remote 大小相同 ──
+    // ── force-remote：无条件下载，不管 size/mtime ──
 
     #[test]
-    fn download_force_remote_same_size_same_mtime_skips() {
+    fn download_force_remote_same_size_same_mtime_still_downloads() {
+        // force-remote：即使 size+mtime 完全相同也要覆盖下载
         let r = decide_download(100, 1000, 100, 1000, HASH, true, false);
-        assert_eq!(r, DownloadDecision::Skip);
+        assert_eq!(r, DownloadDecision::Download);
     }
 
     #[test]
@@ -1366,6 +1372,12 @@ mod tests {
     fn download_force_remote_same_size_local_newer_still_downloads() {
         // force-remote：本地 mtime 更新也要被覆盖
         let r = decide_download(100, 2000, 100, 1000, HASH, true, false);
+        assert_eq!(r, DownloadDecision::Download);
+    }
+
+    #[test]
+    fn download_force_remote_size_diff_downloads() {
+        let r = decide_download(100, 2000, 200, 1000, NO_HASH, true, false);
         assert_eq!(r, DownloadDecision::Download);
     }
 
