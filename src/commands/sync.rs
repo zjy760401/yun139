@@ -519,50 +519,24 @@ fn walk_local_to_cloud(
                     cloud_dir: cloud_dir.to_string(),
                 });
             }
-            Some(ci) if ci.size != le.size as i64 => {
-                let cloud_mtime = parse_cloud_mtime_ms(&ci.updated_at);
-                if ctx.force_local || le.mtime_ms >= cloud_mtime {
-                    to_upload.push(UploadFileInfo {
-                        local: local_dir.join(&le.name),
-                        cloud_dir: cloud_dir.to_string(),
-                    });
-                } else {
-                    tracing::debug!(file = %le.name, "skip: cloud is newer");
-                    skip_count += 1;
-                }
-            }
             Some(ci) => {
-                // 同名同大小，用 mtime 决定是否跳过（force-local 也走此逻辑，不用 SHA256）
                 let cloud_mtime = parse_cloud_mtime_ms(&ci.updated_at);
-                if ctx.force_local {
-                    // force-local：mtime 也相同则跳过，否则覆盖上传
-                    if le.mtime_ms == cloud_mtime {
-                        tracing::debug!(file = %le.name, "force-local: size+mtime match → skip");
-                        skip_count += 1;
-                    } else {
-                        tracing::debug!(file = %le.name, "force-local: mtime diff → upload");
+                match decide_upload(le.size, le.mtime_ms, ci.size, cloud_mtime, &ci.content_hash, ctx.force_local, ctx.checksum) {
+                    UploadDecision::Upload => {
                         to_upload.push(UploadFileInfo {
                             local: local_dir.join(&le.name),
                             cloud_dir: cloud_dir.to_string(),
                         });
                     }
-                } else if ctx.checksum && !ci.content_hash.is_empty() {
-                    // --checksum 模式：SHA256 精确对比
-                    to_hash_check.push(UploadHashCheck {
-                        local: local_dir.join(&le.name),
-                        cloud_dir: cloud_dir.to_string(),
-                        cloud_hash: ci.content_hash.clone(),
-                    });
-                } else {
-                    // 默认模式（mtime 比较）
-                    if le.mtime_ms > cloud_mtime {
-                        tracing::debug!(file = %le.name, local_mtime = le.mtime_ms, cloud_mtime, "mtime newer → upload");
-                        to_upload.push(UploadFileInfo {
+                    UploadDecision::HashCheck { cloud_hash } => {
+                        to_hash_check.push(UploadHashCheck {
                             local: local_dir.join(&le.name),
                             cloud_dir: cloud_dir.to_string(),
+                            cloud_hash,
                         });
-                    } else {
-                        tracing::debug!(file = %le.name, "mtime match → skip");
+                    }
+                    UploadDecision::Skip => {
+                        tracing::debug!(file = %le.name, "skip");
                         skip_count += 1;
                     }
                 }
@@ -716,54 +690,26 @@ fn walk_cloud_to_local(
                     size: ci.size as u64,
                 });
             }
-            Some(le) if le.size as i64 != ci.size => {
+            Some(le) => {
                 let cloud_mtime = parse_cloud_mtime_ms(&ci.updated_at);
-                if ctx.force_remote || cloud_mtime >= le.mtime_ms {
-                    to_download.push(DownloadFileInfo {
-                        cloud: rel_cloud(&ct, &prefix, &ci.name),
-                        local: local_dir.join(&ci.name),
-                        size: ci.size as u64,
-                    });
-                } else {
-                    tracing::debug!(file = %ci.name, "skip: local is newer");
-                    skip_count += 1;
-                }
-            }
-            Some(_le) => {
-                // 同名同大小，用 mtime 决定是否跳过（force-remote 也走此逻辑，不用 SHA256）
-                let cloud_mtime = parse_cloud_mtime_ms(&ci.updated_at);
-                if ctx.force_remote {
-                    // force-remote：mtime 也相同则跳过，否则覆盖下载
-                    if cloud_mtime == _le.mtime_ms {
-                        tracing::debug!(file = %ci.name, "force-remote: size+mtime match → skip");
-                        skip_count += 1;
-                    } else {
-                        tracing::debug!(file = %ci.name, "force-remote: mtime diff → download");
+                match decide_download(le.size, le.mtime_ms, ci.size, cloud_mtime, &ci.content_hash, ctx.force_remote, ctx.checksum) {
+                    DownloadDecision::Download => {
                         to_download.push(DownloadFileInfo {
                             cloud: rel_cloud(&ct, &prefix, &ci.name),
                             local: local_dir.join(&ci.name),
                             size: ci.size as u64,
                         });
                     }
-                } else if ctx.checksum && !ci.content_hash.is_empty() {
-                    // --checksum 模式：SHA256 精确对比
-                    to_hash_check.push(DownloadHashCheck {
-                        cloud: rel_cloud(&ct, &prefix, &ci.name),
-                        local: local_dir.join(&ci.name),
-                        size: ci.size as u64,
-                        cloud_hash: ci.content_hash.clone(),
-                    });
-                } else {
-                    // 默认模式（mtime 比较）
-                    if cloud_mtime > _le.mtime_ms {
-                        tracing::debug!(file = %ci.name, cloud_mtime, local_mtime = _le.mtime_ms, "cloud mtime newer → download");
-                        to_download.push(DownloadFileInfo {
+                    DownloadDecision::HashCheck { cloud_hash } => {
+                        to_hash_check.push(DownloadHashCheck {
                             cloud: rel_cloud(&ct, &prefix, &ci.name),
                             local: local_dir.join(&ci.name),
                             size: ci.size as u64,
+                            cloud_hash,
                         });
-                    } else {
-                        tracing::debug!(file = %ci.name, "mtime match → skip");
+                    }
+                    DownloadDecision::Skip => {
+                        tracing::debug!(file = %ci.name, "skip");
                         skip_count += 1;
                     }
                 }
@@ -1154,4 +1100,278 @@ fn parse_cloud_mtime_ms(updated_at: &str) -> i64 {
         .unwrap_or(0)
 }
 
+// ── 文件同步决策函数（纯函数，便于单元测试）──
 
+#[derive(Debug, PartialEq)]
+pub(crate) enum UploadDecision {
+    /// 需要上传
+    Upload,
+    /// 需要先计算 SHA256 再决定
+    HashCheck { cloud_hash: String },
+    /// 跳过
+    Skip,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum DownloadDecision {
+    /// 需要下载
+    Download,
+    /// 需要先计算 SHA256 再决定
+    HashCheck { cloud_hash: String },
+    /// 跳过
+    Skip,
+}
+
+/// 决定一个本地文件是否需要上传。
+///
+/// `local_size` 与 `cloud_size` 不同视为直接上传候选（由 force/mtime 进一步过滤）。
+/// `local_size` 与 `cloud_size` 相同时，走 force/checksum/mtime 逻辑。
+pub(crate) fn decide_upload(
+    local_size: u64,
+    local_mtime_ms: i64,
+    cloud_size: i64,
+    cloud_mtime_ms: i64,
+    cloud_hash: &str,
+    force_local: bool,
+    checksum: bool,
+) -> UploadDecision {
+    if local_size as i64 != cloud_size {
+        // 大小不同
+        if force_local || local_mtime_ms >= cloud_mtime_ms {
+            UploadDecision::Upload
+        } else {
+            UploadDecision::Skip
+        }
+    } else {
+        // 同名同大小
+        if force_local {
+            if local_mtime_ms == cloud_mtime_ms {
+                UploadDecision::Skip
+            } else {
+                UploadDecision::Upload
+            }
+        } else if checksum && !cloud_hash.is_empty() {
+            UploadDecision::HashCheck { cloud_hash: cloud_hash.to_string() }
+        } else if local_mtime_ms > cloud_mtime_ms {
+            UploadDecision::Upload
+        } else {
+            UploadDecision::Skip
+        }
+    }
+}
+
+/// 决定一个云端文件是否需要下载。
+pub(crate) fn decide_download(
+    local_size: u64,
+    local_mtime_ms: i64,
+    cloud_size: i64,
+    cloud_mtime_ms: i64,
+    cloud_hash: &str,
+    force_remote: bool,
+    checksum: bool,
+) -> DownloadDecision {
+    if local_size as i64 != cloud_size {
+        // 大小不同
+        if force_remote || cloud_mtime_ms >= local_mtime_ms {
+            DownloadDecision::Download
+        } else {
+            DownloadDecision::Skip
+        }
+    } else {
+        // 同名同大小
+        if force_remote {
+            if cloud_mtime_ms == local_mtime_ms {
+                DownloadDecision::Skip
+            } else {
+                DownloadDecision::Download
+            }
+        } else if checksum && !cloud_hash.is_empty() {
+            DownloadDecision::HashCheck { cloud_hash: cloud_hash.to_string() }
+        } else if cloud_mtime_ms > local_mtime_ms {
+            DownloadDecision::Download
+        } else {
+            DownloadDecision::Skip
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HASH: &str = "abc123";
+    const NO_HASH: &str = "";
+
+    // ── decide_upload ──
+
+    #[test]
+    fn upload_new_file() {
+        // 云端不存在时由调用方直接 push，不走 decide_upload。
+        // 此处测试"大小不同 + 本地较新"等同于新文件的处理。
+        let r = decide_upload(100, 2000, 0, 0, NO_HASH, false, false);
+        assert_eq!(r, UploadDecision::Upload);
+    }
+
+    // ── 大小不同 ──
+
+    #[test]
+    fn upload_size_diff_local_newer() {
+        let r = decide_upload(200, 2000, 100, 1000, NO_HASH, false, false);
+        assert_eq!(r, UploadDecision::Upload);
+    }
+
+    #[test]
+    fn upload_size_diff_cloud_newer_skips() {
+        let r = decide_upload(200, 1000, 100, 2000, NO_HASH, false, false);
+        assert_eq!(r, UploadDecision::Skip);
+    }
+
+    #[test]
+    fn upload_size_diff_force_local_overrides_cloud_newer() {
+        // force-local：即使云端更新，大小不同也要上传
+        let r = decide_upload(200, 1000, 100, 2000, NO_HASH, true, false);
+        assert_eq!(r, UploadDecision::Upload);
+    }
+
+    // ── 大小相同 ──
+
+    #[test]
+    fn upload_same_size_mtime_same_skips() {
+        let r = decide_upload(100, 1000, 100, 1000, NO_HASH, false, false);
+        assert_eq!(r, UploadDecision::Skip);
+    }
+
+    #[test]
+    fn upload_same_size_local_mtime_newer() {
+        let r = decide_upload(100, 2000, 100, 1000, NO_HASH, false, false);
+        assert_eq!(r, UploadDecision::Upload);
+    }
+
+    #[test]
+    fn upload_same_size_cloud_mtime_newer_skips() {
+        let r = decide_upload(100, 1000, 100, 2000, NO_HASH, false, false);
+        assert_eq!(r, UploadDecision::Skip);
+    }
+
+    #[test]
+    fn upload_checksum_mode_triggers_hash_check() {
+        let r = decide_upload(100, 1000, 100, 2000, HASH, false, true);
+        assert_eq!(r, UploadDecision::HashCheck { cloud_hash: HASH.to_string() });
+    }
+
+    #[test]
+    fn upload_checksum_mode_no_cloud_hash_falls_back_to_mtime() {
+        // 云端没有 hash 时退回 mtime 比较
+        let r = decide_upload(100, 2000, 100, 1000, NO_HASH, false, true);
+        assert_eq!(r, UploadDecision::Upload);
+    }
+
+    // ── force-local 大小相同 ──
+
+    #[test]
+    fn upload_force_local_same_size_same_mtime_skips() {
+        let r = decide_upload(100, 1000, 100, 1000, HASH, true, false);
+        assert_eq!(r, UploadDecision::Skip);
+    }
+
+    #[test]
+    fn upload_force_local_same_size_mtime_diff_uploads() {
+        let r = decide_upload(100, 2000, 100, 1000, HASH, true, false);
+        assert_eq!(r, UploadDecision::Upload);
+    }
+
+    #[test]
+    fn upload_force_local_same_size_cloud_newer_mtime_still_uploads() {
+        // force-local：云端 mtime 更新也要覆盖
+        let r = decide_upload(100, 1000, 100, 2000, HASH, true, false);
+        assert_eq!(r, UploadDecision::Upload);
+    }
+
+    #[test]
+    fn upload_force_local_no_sha256_used() {
+        // force-local 不应触发 HashCheck，即使有 cloud_hash
+        let r = decide_upload(100, 2000, 100, 1000, HASH, true, false);
+        assert_ne!(r, UploadDecision::HashCheck { cloud_hash: HASH.to_string() });
+    }
+
+    // ── decide_download ──
+
+    // ── 大小不同 ──
+
+    #[test]
+    fn download_size_diff_cloud_newer() {
+        let r = decide_download(100, 1000, 200, 2000, NO_HASH, false, false);
+        assert_eq!(r, DownloadDecision::Download);
+    }
+
+    #[test]
+    fn download_size_diff_local_newer_skips() {
+        let r = decide_download(100, 2000, 200, 1000, NO_HASH, false, false);
+        assert_eq!(r, DownloadDecision::Skip);
+    }
+
+    #[test]
+    fn download_size_diff_force_remote_overrides_local_newer() {
+        let r = decide_download(100, 2000, 200, 1000, NO_HASH, true, false);
+        assert_eq!(r, DownloadDecision::Download);
+    }
+
+    // ── 大小相同 ──
+
+    #[test]
+    fn download_same_size_mtime_same_skips() {
+        let r = decide_download(100, 1000, 100, 1000, NO_HASH, false, false);
+        assert_eq!(r, DownloadDecision::Skip);
+    }
+
+    #[test]
+    fn download_same_size_cloud_mtime_newer() {
+        let r = decide_download(100, 1000, 100, 2000, NO_HASH, false, false);
+        assert_eq!(r, DownloadDecision::Download);
+    }
+
+    #[test]
+    fn download_same_size_local_mtime_newer_skips() {
+        let r = decide_download(100, 2000, 100, 1000, NO_HASH, false, false);
+        assert_eq!(r, DownloadDecision::Skip);
+    }
+
+    #[test]
+    fn download_checksum_mode_triggers_hash_check() {
+        let r = decide_download(100, 1000, 100, 2000, HASH, false, true);
+        assert_eq!(r, DownloadDecision::HashCheck { cloud_hash: HASH.to_string() });
+    }
+
+    #[test]
+    fn download_checksum_no_cloud_hash_falls_back_to_mtime() {
+        let r = decide_download(100, 1000, 100, 2000, NO_HASH, false, true);
+        assert_eq!(r, DownloadDecision::Download);
+    }
+
+    // ── force-remote 大小相同 ──
+
+    #[test]
+    fn download_force_remote_same_size_same_mtime_skips() {
+        let r = decide_download(100, 1000, 100, 1000, HASH, true, false);
+        assert_eq!(r, DownloadDecision::Skip);
+    }
+
+    #[test]
+    fn download_force_remote_same_size_mtime_diff_downloads() {
+        let r = decide_download(100, 2000, 100, 1000, HASH, true, false);
+        assert_eq!(r, DownloadDecision::Download);
+    }
+
+    #[test]
+    fn download_force_remote_same_size_local_newer_still_downloads() {
+        // force-remote：本地 mtime 更新也要被覆盖
+        let r = decide_download(100, 2000, 100, 1000, HASH, true, false);
+        assert_eq!(r, DownloadDecision::Download);
+    }
+
+    #[test]
+    fn download_force_remote_no_sha256_used() {
+        let r = decide_download(100, 2000, 100, 1000, HASH, true, false);
+        assert_ne!(r, DownloadDecision::HashCheck { cloud_hash: HASH.to_string() });
+    }
+}
