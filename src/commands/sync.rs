@@ -370,11 +370,11 @@ fn delete_sort_key(a: &SyncAction) -> (bool, &str) {
 
 // 辅助结构体（定义在模块级别以确保 Future Send 安全性）
 struct UploadFileInfo { local: PathBuf, cloud_dir: String }
-struct UploadHashCheck { local: PathBuf, cloud_dir: String, cloud_hash: String }
+struct UploadHashCheck { local: PathBuf, cloud_dir: String, cloud_hash: String, upload_on_mismatch: bool }
 /// is_new=true 表示云端不存在，需要先 create_folder；file_id=Some 表示云端已有此目录
 struct UploadDirInfo { name: String, cloud_path: String, is_new: bool, file_id: Option<String> }
 struct DownloadFileInfo { cloud: String, local: PathBuf, size: u64 }
-struct DownloadHashCheck { cloud: String, local: PathBuf, size: u64, cloud_hash: String }
+struct DownloadHashCheck { cloud: String, local: PathBuf, size: u64, cloud_hash: String, download_on_mismatch: bool }
 /// file_id=Some 表示云端目录 fileId，传递给 child scan_dir 跳过路径解析
 struct DownloadDirInfo { name: String, is_new: bool, file_id: Option<String> }
 
@@ -528,11 +528,12 @@ fn walk_local_to_cloud(
                             cloud_dir: cloud_dir.to_string(),
                         });
                     }
-                    UploadDecision::HashCheck { cloud_hash } => {
+                    UploadDecision::HashCheck { cloud_hash, upload_on_mismatch } => {
                         to_hash_check.push(UploadHashCheck {
                             local: local_dir.join(&le.name),
                             cloud_dir: cloud_dir.to_string(),
                             cloud_hash,
+                            upload_on_mismatch,
                         });
                     }
                     UploadDecision::Skip => {
@@ -563,7 +564,7 @@ fn walk_local_to_cloud(
     // 分发 hash 检查任务（只在 --checksum 模式下非空）
     if !ctx.download_only {
         for hc in to_hash_check {
-            push_hash_then_upload(&ctx, hc.local, hc.cloud_dir, hc.cloud_hash);
+            push_hash_then_upload(&ctx, hc.local, hc.cloud_dir, hc.cloud_hash, hc.upload_on_mismatch);
         }
     } else {
         ctx.skipped.fetch_add(to_hash_check.len() as u32, Ordering::Relaxed);
@@ -700,12 +701,13 @@ fn walk_cloud_to_local(
                             size: ci.size as u64,
                         });
                     }
-                    DownloadDecision::HashCheck { cloud_hash } => {
+                    DownloadDecision::HashCheck { cloud_hash, download_on_mismatch } => {
                         to_hash_check.push(DownloadHashCheck {
                             cloud: rel_cloud(&ct, &prefix, &ci.name),
                             local: local_dir.join(&ci.name),
                             size: ci.size as u64,
                             cloud_hash,
+                            download_on_mismatch,
                         });
                     }
                     DownloadDecision::Skip => {
@@ -731,7 +733,7 @@ fn walk_cloud_to_local(
     if !ctx.upload_only {
         let parallel = ctx.parallel;
         for hc in to_hash_check {
-            push_hash_then_download(&ctx, hc.cloud, hc.local, hc.size, hc.cloud_hash, parallel);
+            push_hash_then_download(&ctx, hc.cloud, hc.local, hc.size, hc.cloud_hash, parallel, hc.download_on_mismatch);
         }
     } else {
         ctx.skipped.fetch_add(to_hash_check.len() as u32, Ordering::Relaxed);
@@ -841,7 +843,7 @@ fn push_download(ctx: &Arc<SyncCtx>, cloud: String, local: PathBuf, est_size: u6
     });
 }
 
-fn push_hash_then_upload(ctx: &Arc<SyncCtx>, local: PathBuf, cloud_dir: String, cloud_hash: String) {
+fn push_hash_then_upload(ctx: &Arc<SyncCtx>, local: PathBuf, cloud_dir: String, cloud_hash: String, upload_on_mismatch: bool) {
     let ctx2 = ctx.clone();
     spawn_counted(ctx, async move {
         let name = local.file_name().unwrap_or_default().to_string_lossy().to_string();
@@ -866,8 +868,10 @@ fn push_hash_then_upload(ctx: &Arc<SyncCtx>, local: PathBuf, cloud_dir: String, 
         drop(_hash_permit); // 立即释放磁盘槽
         tracing::debug!(file = %name, hash_ms, local_hash = %local_hash, cloud_hash = %cloud_hash, "hash_check done (hash_sem released)");
 
-        if local_hash != cloud_hash {
-            // 哈希不一致 → 需要重新上传
+        if local_hash == cloud_hash {
+            tracing::debug!(file = %name, hash_ms, "hash match → skip ✓");
+            ctx2.skipped.fetch_add(1, Ordering::Relaxed);
+        } else if upload_on_mismatch {
             tracing::debug!(file = %name, hash_ms, "hash mismatch → upload");
             ctx2.overall_pb.inc_length(1);
             // Phase 2: 获取网络上传槽
@@ -875,13 +879,13 @@ fn push_hash_then_upload(ctx: &Arc<SyncCtx>, local: PathBuf, cloud_dir: String, 
             tracing::debug!(file = %name, "got global_sem, starting upload (hash mismatch)");
             do_upload_task(&ctx2, local, cloud_dir, local_hash, file_size).await;
         } else {
-            tracing::debug!(file = %name, hash_ms, "hash match → skip ✓");
+            tracing::debug!(file = %name, hash_ms, "hash mismatch but cloud is newer → skip");
             ctx2.skipped.fetch_add(1, Ordering::Relaxed);
         }
     });
 }
 
-fn push_hash_then_download(ctx: &Arc<SyncCtx>, cloud: String, local: PathBuf, est_size: u64, cloud_hash: String, parallel: usize) {
+fn push_hash_then_download(ctx: &Arc<SyncCtx>, cloud: String, local: PathBuf, est_size: u64, cloud_hash: String, parallel: usize, download_on_mismatch: bool) {
     let ctx2 = ctx.clone();
     spawn_counted(ctx, async move {
         let name = local.file_name().unwrap_or_default().to_string_lossy().to_string();
@@ -891,7 +895,7 @@ fn push_hash_then_download(ctx: &Arc<SyncCtx>, cloud: String, local: PathBuf, es
         let _hash_permit = ctx2.hash_sem.acquire().await.unwrap();
         tracing::debug!(file = %name, "hash_check: computing local SHA256 (hash_sem acquired)");
         let local_hash = match Yun139Client::sha256_file(&local).await {
-            Ok((h, _)) => h,  // 文件大小在下载场景不需要
+            Ok((h, _)) => h,
             Err(e) => {
                 tracing::error!(file = %name, err = %e, "hash_check SHA256 failed, skip");
                 ctx2.failed.fetch_add(1, Ordering::Relaxed);
@@ -904,16 +908,17 @@ fn push_hash_then_download(ctx: &Arc<SyncCtx>, cloud: String, local: PathBuf, es
         drop(_hash_permit);
         tracing::debug!(file = %name, hash_ms, local_hash = %local_hash, cloud_hash = %cloud_hash, "hash_check done (hash_sem released)");
 
-        if local_hash != cloud_hash {
-            // 哈希不一致 → 需要重新下载
+        if local_hash == cloud_hash {
+            tracing::debug!(file = %name, hash_ms, "hash match → skip ✓");
+            ctx2.skipped.fetch_add(1, Ordering::Relaxed);
+        } else if download_on_mismatch {
             tracing::debug!(file = %name, hash_ms, "hash mismatch → download");
             ctx2.overall_pb.inc_length(1);
-            // Phase 2: 获取网络下载槽
             let _permit = ctx2.global_sem.acquire().await.unwrap();
             tracing::debug!(file = %name, "got global_sem, starting download (hash mismatch)");
             do_download_task(&ctx2, cloud, local, est_size, parallel).await;
         } else {
-            tracing::debug!(file = %name, hash_ms, "hash match → skip ✓");
+            tracing::debug!(file = %name, hash_ms, "hash mismatch but local is newer → skip");
             ctx2.skipped.fetch_add(1, Ordering::Relaxed);
         }
     });
@@ -1106,8 +1111,8 @@ fn parse_cloud_mtime_ms(updated_at: &str) -> i64 {
 pub(crate) enum UploadDecision {
     /// 需要上传
     Upload,
-    /// 需要先计算 SHA256 再决定
-    HashCheck { cloud_hash: String },
+    /// 需要先计算 SHA256 再决定；upload_on_mismatch=true 时哈希不一致则上传，false 则跳过
+    HashCheck { cloud_hash: String, upload_on_mismatch: bool },
     /// 跳过
     Skip,
 }
@@ -1116,16 +1121,22 @@ pub(crate) enum UploadDecision {
 pub(crate) enum DownloadDecision {
     /// 需要下载
     Download,
-    /// 需要先计算 SHA256 再决定
-    HashCheck { cloud_hash: String },
+    /// 需要先计算 SHA256 再决定；download_on_mismatch=true 时哈希不一致则下载，false 则跳过
+    HashCheck { cloud_hash: String, download_on_mismatch: bool },
     /// 跳过
     Skip,
 }
 
 /// 决定一个本地文件是否需要上传。
 ///
-/// `local_size` 与 `cloud_size` 不同视为直接上传候选（由 force/mtime 进一步过滤）。
-/// `local_size` 与 `cloud_size` 相同时，走 force/checksum/mtime 逻辑。
+/// 规则（按优先级）：
+/// - size 不同
+///   - force_local → Upload
+///   - 普通：local_mtime >= cloud_mtime → Upload，否则 Skip
+/// - size 相同 + mtime 相同 → Skip（所有模式）
+/// - size 相同 + mtime 不同 → SHA256 对比（所有模式）
+///   - hash 相同 → Skip
+///   - hash 不同 + (force_local 或 local 更新) → Upload，否则 Skip
 pub(crate) fn decide_upload(
     local_size: u64,
     local_mtime_ms: i64,
@@ -1133,33 +1144,44 @@ pub(crate) fn decide_upload(
     cloud_mtime_ms: i64,
     cloud_hash: &str,
     force_local: bool,
-    checksum: bool,
+    _checksum: bool,
 ) -> UploadDecision {
-    // --force-local：无条件用本地覆盖云端，不做任何跳过
-    if force_local {
-        return UploadDecision::Upload;
-    }
-
     if local_size as i64 != cloud_size {
-        // 大小不同：本地 mtime >= 云端则上传，否则云端更新跳过
-        if local_mtime_ms >= cloud_mtime_ms {
+        // 大小不同
+        if force_local || local_mtime_ms >= cloud_mtime_ms {
             UploadDecision::Upload
         } else {
             UploadDecision::Skip
         }
+    } else if local_mtime_ms == cloud_mtime_ms {
+        // 大小相同 + mtime 相同 → 所有模式跳过
+        UploadDecision::Skip
     } else {
-        // 同名同大小
-        if checksum && !cloud_hash.is_empty() {
-            UploadDecision::HashCheck { cloud_hash: cloud_hash.to_string() }
-        } else if local_mtime_ms > cloud_mtime_ms {
-            UploadDecision::Upload
+        // 大小相同 + mtime 不同 → SHA256 对比
+        // hash 为空时（云端未提供）保守处理：按 mtime/force 决定
+        if cloud_hash.is_empty() {
+            if force_local || local_mtime_ms > cloud_mtime_ms {
+                UploadDecision::Upload
+            } else {
+                UploadDecision::Skip
+            }
         } else {
-            UploadDecision::Skip
+            let upload_on_mismatch = force_local || local_mtime_ms > cloud_mtime_ms;
+            UploadDecision::HashCheck { cloud_hash: cloud_hash.to_string(), upload_on_mismatch }
         }
     }
 }
 
 /// 决定一个云端文件是否需要下载。
+///
+/// 规则（按优先级）：
+/// - size 不同
+///   - force_remote → Download
+///   - 普通：cloud_mtime >= local_mtime → Download，否则 Skip
+/// - size 相同 + mtime 相同 → Skip（所有模式）
+/// - size 相同 + mtime 不同 → SHA256 对比（所有模式）
+///   - hash 相同 → Skip
+///   - hash 不同 + (force_remote 或 cloud 更新) → Download，否则 Skip
 pub(crate) fn decide_download(
     local_size: u64,
     local_mtime_ms: i64,
@@ -1167,28 +1189,29 @@ pub(crate) fn decide_download(
     cloud_mtime_ms: i64,
     cloud_hash: &str,
     force_remote: bool,
-    checksum: bool,
+    _checksum: bool,
 ) -> DownloadDecision {
-    // --force-remote：无条件用云端覆盖本地，不做任何跳过
-    if force_remote {
-        return DownloadDecision::Download;
-    }
-
     if local_size as i64 != cloud_size {
-        // 大小不同：云端 mtime >= 本地则下载，否则本地更新跳过
-        if cloud_mtime_ms >= local_mtime_ms {
+        // 大小不同
+        if force_remote || cloud_mtime_ms >= local_mtime_ms {
             DownloadDecision::Download
         } else {
             DownloadDecision::Skip
         }
+    } else if cloud_mtime_ms == local_mtime_ms {
+        // 大小相同 + mtime 相同 → 所有模式跳过
+        DownloadDecision::Skip
     } else {
-        // 同名同大小
-        if checksum && !cloud_hash.is_empty() {
-            DownloadDecision::HashCheck { cloud_hash: cloud_hash.to_string() }
-        } else if cloud_mtime_ms > local_mtime_ms {
-            DownloadDecision::Download
+        // 大小相同 + mtime 不同 → SHA256 对比
+        if cloud_hash.is_empty() {
+            if force_remote || cloud_mtime_ms > local_mtime_ms {
+                DownloadDecision::Download
+            } else {
+                DownloadDecision::Skip
+            }
         } else {
-            DownloadDecision::Skip
+            let download_on_mismatch = force_remote || cloud_mtime_ms > local_mtime_ms;
+            DownloadDecision::HashCheck { cloud_hash: cloud_hash.to_string(), download_on_mismatch }
         }
     }
 }
@@ -1253,8 +1276,9 @@ mod tests {
 
     #[test]
     fn upload_checksum_mode_triggers_hash_check() {
+        // size same + mtime diff (cloud newer) → HashCheck, upload_on_mismatch=false
         let r = decide_upload(100, 1000, 100, 2000, HASH, false, true);
-        assert_eq!(r, UploadDecision::HashCheck { cloud_hash: HASH.to_string() });
+        assert_eq!(r, UploadDecision::HashCheck { cloud_hash: HASH.to_string(), upload_on_mismatch: false });
     }
 
     #[test]
@@ -1264,26 +1288,27 @@ mod tests {
         assert_eq!(r, UploadDecision::Upload);
     }
 
-    // ── force-local：无条件上传，不管 size/mtime ──
+    // ── force-local 大小相同 ──
 
     #[test]
-    fn upload_force_local_same_size_same_mtime_still_uploads() {
-        // force-local：即使 size+mtime 完全相同也要覆盖上传
+    fn upload_force_local_same_size_same_mtime_skips() {
+        // size+mtime 完全相同 → 所有模式跳过（包括 force-local）
         let r = decide_upload(100, 1000, 100, 1000, HASH, true, false);
-        assert_eq!(r, UploadDecision::Upload);
+        assert_eq!(r, UploadDecision::Skip);
     }
 
     #[test]
-    fn upload_force_local_same_size_mtime_diff_uploads() {
+    fn upload_force_local_same_size_local_newer_hash_check() {
+        // force-local + same size + local newer → HashCheck, upload_on_mismatch=true
         let r = decide_upload(100, 2000, 100, 1000, HASH, true, false);
-        assert_eq!(r, UploadDecision::Upload);
+        assert_eq!(r, UploadDecision::HashCheck { cloud_hash: HASH.to_string(), upload_on_mismatch: true });
     }
 
     #[test]
-    fn upload_force_local_same_size_cloud_newer_mtime_still_uploads() {
-        // force-local：云端 mtime 更新也要覆盖
+    fn upload_force_local_same_size_cloud_newer_still_hash_check_with_upload() {
+        // force-local：云端 mtime 更新也要覆盖 → HashCheck, upload_on_mismatch=true
         let r = decide_upload(100, 1000, 100, 2000, HASH, true, false);
-        assert_eq!(r, UploadDecision::Upload);
+        assert_eq!(r, UploadDecision::HashCheck { cloud_hash: HASH.to_string(), upload_on_mismatch: true });
     }
 
     #[test]
@@ -1293,10 +1318,17 @@ mod tests {
     }
 
     #[test]
-    fn upload_force_local_no_sha256_used() {
-        // force-local 不应触发 HashCheck，即使有 cloud_hash
-        let r = decide_upload(100, 2000, 100, 1000, HASH, true, false);
-        assert_ne!(r, UploadDecision::HashCheck { cloud_hash: HASH.to_string() });
+    fn upload_normal_same_size_local_newer_hash_check_upload_on_mismatch() {
+        // 普通模式 + same size + local newer → HashCheck, upload_on_mismatch=true
+        let r = decide_upload(100, 2000, 100, 1000, HASH, false, false);
+        assert_eq!(r, UploadDecision::HashCheck { cloud_hash: HASH.to_string(), upload_on_mismatch: true });
+    }
+
+    #[test]
+    fn upload_normal_same_size_cloud_newer_hash_check_no_upload() {
+        // 普通模式 + same size + cloud newer → HashCheck, upload_on_mismatch=false
+        let r = decide_upload(100, 1000, 100, 2000, HASH, false, false);
+        assert_eq!(r, UploadDecision::HashCheck { cloud_hash: HASH.to_string(), upload_on_mismatch: false });
     }
 
     // ── decide_download ──
@@ -1343,8 +1375,9 @@ mod tests {
 
     #[test]
     fn download_checksum_mode_triggers_hash_check() {
+        // size same + cloud newer → HashCheck, download_on_mismatch=true
         let r = decide_download(100, 1000, 100, 2000, HASH, false, true);
-        assert_eq!(r, DownloadDecision::HashCheck { cloud_hash: HASH.to_string() });
+        assert_eq!(r, DownloadDecision::HashCheck { cloud_hash: HASH.to_string(), download_on_mismatch: true });
     }
 
     #[test]
@@ -1353,26 +1386,27 @@ mod tests {
         assert_eq!(r, DownloadDecision::Download);
     }
 
-    // ── force-remote：无条件下载，不管 size/mtime ──
+    // ── force-remote 大小相同 ──
 
     #[test]
-    fn download_force_remote_same_size_same_mtime_still_downloads() {
-        // force-remote：即使 size+mtime 完全相同也要覆盖下载
+    fn download_force_remote_same_size_same_mtime_skips() {
+        // size+mtime 完全相同 → 所有模式跳过（包括 force-remote）
         let r = decide_download(100, 1000, 100, 1000, HASH, true, false);
-        assert_eq!(r, DownloadDecision::Download);
+        assert_eq!(r, DownloadDecision::Skip);
     }
 
     #[test]
-    fn download_force_remote_same_size_mtime_diff_downloads() {
+    fn download_force_remote_same_size_local_newer_hash_check() {
+        // force-remote + same size + local newer → HashCheck, download_on_mismatch=true
         let r = decide_download(100, 2000, 100, 1000, HASH, true, false);
-        assert_eq!(r, DownloadDecision::Download);
+        assert_eq!(r, DownloadDecision::HashCheck { cloud_hash: HASH.to_string(), download_on_mismatch: true });
     }
 
     #[test]
-    fn download_force_remote_same_size_local_newer_still_downloads() {
-        // force-remote：本地 mtime 更新也要被覆盖
-        let r = decide_download(100, 2000, 100, 1000, HASH, true, false);
-        assert_eq!(r, DownloadDecision::Download);
+    fn download_force_remote_same_size_cloud_newer_hash_check() {
+        // force-remote + same size + cloud newer → HashCheck, download_on_mismatch=true
+        let r = decide_download(100, 1000, 100, 2000, HASH, true, false);
+        assert_eq!(r, DownloadDecision::HashCheck { cloud_hash: HASH.to_string(), download_on_mismatch: true });
     }
 
     #[test]
@@ -1382,8 +1416,16 @@ mod tests {
     }
 
     #[test]
-    fn download_force_remote_no_sha256_used() {
-        let r = decide_download(100, 2000, 100, 1000, HASH, true, false);
-        assert_ne!(r, DownloadDecision::HashCheck { cloud_hash: HASH.to_string() });
+    fn download_normal_same_size_cloud_newer_hash_check_download_on_mismatch() {
+        // 普通模式 + same size + cloud newer → HashCheck, download_on_mismatch=true
+        let r = decide_download(100, 1000, 100, 2000, HASH, false, false);
+        assert_eq!(r, DownloadDecision::HashCheck { cloud_hash: HASH.to_string(), download_on_mismatch: true });
+    }
+
+    #[test]
+    fn download_normal_same_size_local_newer_hash_check_no_download() {
+        // 普通模式 + same size + local newer → HashCheck, download_on_mismatch=false
+        let r = decide_download(100, 2000, 100, 1000, HASH, false, false);
+        assert_eq!(r, DownloadDecision::HashCheck { cloud_hash: HASH.to_string(), download_on_mismatch: false });
     }
 }
